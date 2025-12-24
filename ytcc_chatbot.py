@@ -72,8 +72,8 @@ YT_API_KEYS     = _as_list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
 GEMINI_API_KEYS = _as_list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
 
 # Gemini models (optional)
-GEMINI_MODEL_REPORT = st.secrets.get("GEMINI_MODEL_REPORT", "gemini-2.5-flash")
-GEMINI_MODEL_CHAT   = st.secrets.get("GEMINI_MODEL_CHAT", "gemini-2.5-flash-lite")
+GEMINI_MODEL_REPORT = st.secrets.get("GEMINI_MODEL_REPORT", "gemini-3-flash-preview")
+GEMINI_MODEL_CHAT   = st.secrets.get("GEMINI_MODEL_CHAT", "gemini-2.5-flash")
 
 GEMINI_TIMEOUT = 180
 GEMINI_MAX_TOKENS_REPORT = 8192

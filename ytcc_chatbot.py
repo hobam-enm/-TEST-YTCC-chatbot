@@ -89,7 +89,7 @@ SESSION_GITHUB_BRANCH = st.secrets.get("SESSION_GITHUB_BRANCH", "main") or os.en
 CACHE_GITHUB_TOKEN  = st.secrets.get("CACHE_GITHUB_TOKEN", "") or os.environ.get("CACHE_GITHUB_TOKEN", "")
 CACHE_GITHUB_REPO   = st.secrets.get("CACHE_GITHUB_REPO", "")  or os.environ.get("CACHE_GITHUB_REPO", "")
 CACHE_GITHUB_BRANCH = st.secrets.get("CACHE_GITHUB_BRANCH", "main") or os.environ.get("CACHE_GITHUB_BRANCH", "main")
-CACHE_GITHUB_PATH   = st.secrets.get("CACHE_GITHUB_PATH", "cache") or os.environ.get("CACHE_GITHUB_PATH", "cache")  # repo 내 폴더 경로
+CACHE_GITHUB_PATH   = st.secrets.get("CACHE_GITHUB_PATH", "") or os.environ.get("CACHE_GITHUB_PATH", "")  #
 
 # endregion
 

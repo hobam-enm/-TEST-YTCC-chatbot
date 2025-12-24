@@ -86,10 +86,22 @@ SESSION_GITHUB_REPO   = st.secrets.get("SESSION_GITHUB_REPO", "")  or os.environ
 SESSION_GITHUB_BRANCH = st.secrets.get("SESSION_GITHUB_BRANCH", "main") or os.environ.get("SESSION_GITHUB_BRANCH", "main")
 
 # GitHub (캐시 동기화용, 옵션) — 별도 토큰/레포
-CACHE_GITHUB_TOKEN  = st.secrets.get("CACHE_GITHUB_TOKEN", "") or os.environ.get("CACHE_GITHUB_TOKEN", "")
-CACHE_GITHUB_REPO   = st.secrets.get("CACHE_GITHUB_REPO", "")  or os.environ.get("CACHE_GITHUB_REPO", "")
-CACHE_GITHUB_BRANCH = st.secrets.get("CACHE_GITHUB_BRANCH", "main") or os.environ.get("CACHE_GITHUB_BRANCH", "main")
-CACHE_GITHUB_PATH   = st.secrets.get("CACHE_GITHUB_PATH", "") or os.environ.get("CACHE_GITHUB_PATH", "")  #
+def _cfg(key: str, default: str = "") -> str:
+    # secrets에 키가 존재하면(빈 문자열 포함) 그 값을 그대로 사용
+    try:
+        if key in st.secrets:
+            v = st.secrets[key]
+            return "" if v is None else str(v)
+    except Exception:
+        pass
+    return str(os.environ.get(key, default) or default)
+
+CACHE_GITHUB_TOKEN  = _cfg("CACHE_GITHUB_TOKEN", "")
+CACHE_GITHUB_REPO   = _cfg("CACHE_GITHUB_REPO", "")
+CACHE_GITHUB_BRANCH = _cfg("CACHE_GITHUB_BRANCH", "main")
+# repo 루트면 빈 문자열("") 또는 "." 사용 가능
+CACHE_GITHUB_PATH   = _cfg("CACHE_GITHUB_PATH", "")
+
 
 # endregion
 
@@ -504,8 +516,8 @@ def github_download_file(download_url: str, token: str) -> bytes:
     return r.content
 
 def sync_cache_from_github(cache_dir: str) -> Tuple[bool, str, List[str]]:
-    if not (CACHE_GITHUB_TOKEN and CACHE_GITHUB_REPO and CACHE_GITHUB_PATH):
-        return False, "CACHE_GITHUB_TOKEN/REPO/PATH 설정이 없습니다.", []
+    if not (CACHE_GITHUB_TOKEN and CACHE_GITHUB_REPO):
+        return False, "CACHE_GITHUB_TOKEN / CACHE_GITHUB_REPO 설정이 없습니다.", []
     os.makedirs(cache_dir, exist_ok=True)
     items = github_list_dir(CACHE_GITHUB_REPO, CACHE_GITHUB_BRANCH, CACHE_GITHUB_PATH, CACHE_GITHUB_TOKEN)
     picked = [it for it in items if it.get("type") == "file" and str(it.get("name", "")).startswith("cache_token_") and str(it.get("name", "")).endswith(".json")]

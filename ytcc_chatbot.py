@@ -141,9 +141,9 @@ st.markdown(
 _YT_FALLBACK, _GEM_FALLBACK = [], []
 YT_API_KEYS       = list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
 GEMINI_API_KEYS   = list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
-GEMINI_MODEL      = "gemini-2.5-flash-lite"  
+GEMINI_MODEL      = "gemini-3.0-flash-preview"  
 GEMINI_TIMEOUT    = 120
-GEMINI_MAX_TOKENS = 2048
+GEMINI_MAX_TOKENS = 8192
 MAX_TOTAL_COMMENTS   = 120_000
 MAX_COMMENTS_PER_VID = 4_000
 
@@ -860,9 +860,30 @@ def render_metadata_and_downloads():
             with col3: st.download_button("영상목록", video_csv_data, f"videos_{keywords_str}_{now_str}.csv", "text/csv")
 
 def render_chat():
+    # ✅ 리포트(HTML)와 일반 대화(Markdown)를 같은 UI에서 자연스럽게 렌더링
     for msg in st.session_state.chat:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+        with st.chat_message(msg.get("role", "user")):
+            c = msg.get("content", "")
+            if isinstance(c, str) and msg.get("role") == "assistant" and re.match(r"\s*<", c):
+                # HTML로 보이는 응답(1차 리포트 등)은 컴포넌트로 렌더링
+                html_body = c
+                if ("yt-report" in html_body) and ("<style" not in html_body.lower()):
+                    # 기본 CSS 폴백(프롬프트가 스타일을 안 주더라도 보기 좋게)
+                    html_body = """<style>
+                    .yt-report{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; line-height:1.5; padding:12px;}
+                    .yt-report .header{display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom:12px;}
+                    .yt-report .badge{display:inline-block; padding:4px 10px; border-radius:999px; border:1px solid #ddd; font-size:12px; margin-right:6px;}
+                    .yt-report .card{border:1px solid #e8e8e8; border-radius:14px; padding:14px; margin:12px 0; box-shadow:0 6px 16px rgba(0,0,0,0.06);}
+                    .yt-report table{width:100%; border-collapse:collapse; font-size:13px;}
+                    .yt-report th,.yt-report td{border-top:1px solid #eee; padding:8px 10px; vertical-align:top;}
+                    .yt-report th{width:140px; color:#333; text-align:left; white-space:nowrap;}
+                    .yt-report .quote{border-left:3px solid #bbb; padding-left:10px; margin:6px 0; color:#333;}
+                    .yt-report .muted{color:#666; font-size:12px;}
+                    .yt-report hr{border:none; border-top:1px solid #eee; margin:14px 0;}
+                    </style>""" + html_body
+                st_html(html_body, height=900, scrolling=True)
+            else:
+                st.markdown(c)
 # endregion
 
 # region [Main Pipeline]

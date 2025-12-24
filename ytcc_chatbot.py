@@ -1,148 +1,46 @@
-# -*- coding: utf-8 -*-
-"""
-💬 YouTube Comment Compass — ytcc vNext (CACHE-ONLY Own-IP)
 
-✅ 사용자 합의 반영(최종)
-1) Deep 수집 유지: 댓글은 가능한 한 전체(페이지네이션) 수집. "총량/영상당 상한" 강제 제한 없음.
-2) 자사 IP 모드(토글 ON): PGC 영상 ID는 "ytan 캐시 JSON(cache_token_*.json)"에서만 검색 (키워드만)
-   - 캐시가 없으면 자사 IP 모드는 동작하지 않음(에러 안내) — fallback 없음.
-3) 자사 IP 모드(토글 ON)에서만: PGC(캐시) + 외부 UGC 혼합(OST 제외)으로 영상 풀 구성.
-4) 토글 OFF: 기존처럼 YouTube Search 기반(전 유튜브) 영상 풀 구성.
-5) 리포팅: 1차 질문은 ytan 스타일 HTML 리포트(1차 질문 프롬프트.md).
-6) 후속질의: 자연스러운 대화형(규칙 준수: OST 제외, 욕설 *** 마스킹, 인용 최소화 등).
-7) GitHub 토큰 분리:
-   - 세션 저장용: SESSION_GITHUB_*
-   - 캐시 동기화(옵션): CACHE_GITHUB_*
-"""
-
-# ==========================================================
-# region [1. Imports & Basic Setup]
-# ==========================================================
+# region [Imports & Setup]
+import streamlit as st
+import pandas as pd
 import os
 import re
-import io
-import csv
+import gc
 import time
 import json
 import base64
-import random
-import hashlib
-from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
-from typing import Callable, Dict, List, Optional, Tuple
-
-import streamlit as st
-import pandas as pd
 import requests
-from streamlit.components.v1 import html as st_html
+from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import uuid4
+import io
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import google.generativeai as genai
+from streamlit.components.v1 import html as st_html
 
-KST = timezone(timedelta(hours=9))
+# 경로 및 GitHub 설정
 BASE_DIR = "/tmp"
 SESS_DIR = os.path.join(BASE_DIR, "sessions")
-CACHE_DIR_DEFAULT = os.path.join(BASE_DIR, "yt_cache")
 os.makedirs(SESS_DIR, exist_ok=True)
-os.makedirs(CACHE_DIR_DEFAULT, exist_ok=True)
 
-PROMPT_FILE_1ST = "1차 질문 프롬프트.md"  # repo에 함께 두는 것을 권장
-OST_EXCLUDE_RE = re.compile(r"\b(ost|o\.s\.t)\b", re.I)
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "")
+GITHUB_BRANCH = st.secrets.get("GITHUB_BRANCH", "main")
 
-# endregion
+# (추가) 자사(PGC) 메타데이터 캐시 GitHub 설정 (세션 저장 레포와 분리 가능)
+# - 자사 모드 토글 ON 시, 아래 레포에서 cache_token_*.json을 내려받아 PGC 영상 후보를 확보합니다.
+CACHE_GITHUB_TOKEN  = st.secrets.get("CACHE_GITHUB_TOKEN", "")
+CACHE_GITHUB_REPO   = st.secrets.get("CACHE_GITHUB_REPO", "")
+CACHE_GITHUB_BRANCH = st.secrets.get("CACHE_GITHUB_BRANCH", "main")
+# 레포 루트에 파일이 있으면 "" 또는 "." 로 두면 됩니다.
+CACHE_GITHUB_PATH   = st.secrets.get("CACHE_GITHUB_PATH", "")
 
+# (추가) 1차 분석 프롬프트 파일 (레포에 함께 커밋해두면 자동 적용)
+FIRST_TURN_PROMPT_FILE = "1차 질문 프롬프트.md"
 
-# ==========================================================
-# region [2. Secrets / Config]
-# ==========================================================
-def _as_list(x):
-    if x is None:
-        return []
-    if isinstance(x, (list, tuple)):
-        return [str(v).strip() for v in x if str(v).strip()]
-    if isinstance(x, str):
-        parts = re.split(r"[,\n]+", x)
-        return [p.strip() for p in parts if p.strip()]
-    return [str(x).strip()] if str(x).strip() else []
+KST = timezone(timedelta(hours=9))
 
-_YT_FALLBACK = _as_list(os.environ.get("YT_API_KEYS", ""))
-_GEM_FALLBACK = _as_list(os.environ.get("GEMINI_API_KEYS", ""))
-
-YT_API_KEYS     = _as_list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
-GEMINI_API_KEYS = _as_list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
-
-# Gemini models (optional)
-GEMINI_MODEL_REPORT = st.secrets.get("GEMINI_MODEL_REPORT", "gemini-3.0-flash-preview")
-GEMINI_MODEL_CHAT   = st.secrets.get("GEMINI_MODEL_CHAT", "gemini-2.5-flash")
-
-GEMINI_TIMEOUT = 180
-GEMINI_MAX_TOKENS_REPORT = 8192
-GEMINI_MAX_TOKENS_CHAT   = 2048
-
-# GitHub (세션 저장용) — 별도 토큰/레포
-SESSION_GITHUB_TOKEN  = st.secrets.get("SESSION_GITHUB_TOKEN", "") or os.environ.get("SESSION_GITHUB_TOKEN", "")
-SESSION_GITHUB_REPO   = st.secrets.get("SESSION_GITHUB_REPO", "")  or os.environ.get("SESSION_GITHUB_REPO", "")
-SESSION_GITHUB_BRANCH = st.secrets.get("SESSION_GITHUB_BRANCH", "main") or os.environ.get("SESSION_GITHUB_BRANCH", "main")
-
-# GitHub (캐시 동기화용, 옵션) — 별도 토큰/레포
-def _cfg(key: str, default: str = "") -> str:
-    # secrets에 키가 존재하면(빈 문자열 포함) 그 값을 그대로 사용
-    try:
-        if key in st.secrets:
-            v = st.secrets[key]
-            return "" if v is None else str(v)
-    except Exception:
-        pass
-    return str(os.environ.get(key, default) or default)
-
-CACHE_GITHUB_TOKEN  = _cfg("CACHE_GITHUB_TOKEN", "")
-CACHE_GITHUB_REPO   = _cfg("CACHE_GITHUB_REPO", "")
-CACHE_GITHUB_BRANCH = _cfg("CACHE_GITHUB_BRANCH", "main")
-# repo 루트면 빈 문자열("") 또는 "." 사용 가능
-CACHE_GITHUB_PATH   = _cfg("CACHE_GITHUB_PATH", "")
-
-
-# endregion
-
-
-# ==========================================================
-# region [3. Session State]
-# ==========================================================
-def ensure_state():
-    defaults = {
-        "chat": [],
-        "report_html": "",
-        "report_done": False,
-
-        "last_schema": None,
-        "last_csv": "",
-        "last_df": None,
-        "sample_text": "",
-
-        "own_ip_enabled": False,
-        "include_replies": True,
-
-        # cache state
-        "cache_dir": CACHE_DIR_DEFAULT,
-        "cache_files": [],         # list of local paths
-        "cache_loaded": False,
-        "cache_video_rows": [],    # list of dicts with id/title/date/description
-
-        "video_source_mode": "search",  # "search" | "own_ip_cache"
-        "loaded_session_name": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-ensure_state()
-# endregion
-
-
-# ==========================================================
-# region [4. Time Helpers]
-# ==========================================================
 def now_kst() -> datetime:
     return datetime.now(tz=KST)
 
@@ -155,930 +53,1207 @@ def kst_to_rfc3339_utc(dt_kst: datetime) -> str:
     if dt_kst.tzinfo is None:
         dt_kst = dt_kst.replace(tzinfo=KST)
     return dt_kst.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
-def parse_utc_to_kst(dt_str: str) -> datetime:
-    if not dt_str:
-        return now_kst()
-    s = str(dt_str).strip()
-    try:
-        if s.endswith("Z"):
-            s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(KST)
-    except Exception:
-        return now_kst()
-
 # endregion
 
+# region [Page Config & CSS]
+st.set_page_config(
+    page_title="유튜브 댓글분석: 챗봇",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ==========================================================
-# region [5. Rotating Keys & YouTube Client]
-# ==========================================================
+st.markdown(
+    """
+<style>
+  /* Streamlit 메인 컨테이너 패딩 최소화 */
+  .main .block-container {
+      padding-top: 2rem;
+      padding-right: 1rem;
+      padding-left: 1rem;
+      padding-bottom: 5rem;
+  }
+  [data-testid="stSidebarContent"] {
+      padding-top: 1.5rem;
+  }
+  header {visibility: hidden;}
+  footer {visibility: hidden;}
+  #MainMenu {visibility: hidden;}
+
+  /* 사이드바 너비 고정 */
+  [data-testid="stSidebar"] {
+      width: 350px !important;
+      min-width: 350px !important;
+      max-width: 350px !important;
+  }
+  [data-testid="stSidebar"] + div[class*="resizer"] {
+      display: none;
+  }
+
+  /* AI 답변 폰트 크기 조정 */
+  [data-testid="stChatMessage"]:has(span[data-testid="chat-avatar-assistant"]) p,
+  [data-testid="stChatMessage"]:has(span[data-testid="chat-avatar-assistant"]) li {
+      font-size: 0.95rem;
+  }
+
+  /* 다운로드 버튼 스타일 */
+  .stDownloadButton button {
+      background-color: transparent;
+      color: #1c83e1;
+      border: none;
+      padding: 0;
+      text-decoration: underline;
+      font-size: 14px;
+      font-weight: normal;
+  }
+  .stDownloadButton button:hover {
+      color: #0b5cab;
+  }
+
+  /* 세션 목록 버튼 스타일 */
+  .session-list .stButton button {
+      font-size: 0.9rem;
+      text-align: left;
+      font-weight: normal;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: block;
+  }
+
+  /* 새 채팅 버튼 스타일 */
+  .new-chat-btn button {
+      background-color: #e8f0fe;
+      color: #0052CC !important;
+      border: 1px solid #d2e3fc !important;
+  }
+  .new-chat-btn button:hover {
+      background-color: #d2e3fc;
+      color: #0041A3 !important;
+      border: 1px solid #c2d8f8 !important;
+  }
+</style>
+""",
+    unsafe_allow_html=True
+)
+# endregion
+
+# region [Constants & State Management]
+_YT_FALLBACK, _GEM_FALLBACK = [], []
+YT_API_KEYS       = list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
+GEMINI_API_KEYS   = list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
+GEMINI_MODEL      = "gemini-2.5-flash-lite"  
+GEMINI_TIMEOUT    = 120
+GEMINI_MAX_TOKENS = 2048
+MAX_TOTAL_COMMENTS   = 120_000
+MAX_COMMENTS_PER_VID = 4_000
+
+def ensure_state():
+    defaults = {
+        "chat": [],
+        "last_schema": None,
+        "last_csv": "",
+        "last_df": None,
+        "sample_text": "",
+        "loaded_session_name": None,
+        "own_ip_mode": False,
+        "own_ip_toggle_prev": None,
+        "own_ip_cache_synced": False,
+        "own_ip_cache_last_sync": None,
+        "own_ip_cache_error": None,
+        "pgc_video_ids": []
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+ensure_state()
+# endregion
+
+# region [Helper Classes]
 class RotatingKeys:
-    def __init__(self, keys: List[str], idx_seed: str = "default"):
-        self.keys = [k for k in keys if k]
-        if not self.keys:
-            self._idx = 0
-        else:
-            h = int(hashlib.md5(idx_seed.encode("utf-8")).hexdigest(), 16)
-            self._idx = h % len(self.keys)
+    def __init__(self, keys, state_key: str, on_rotate=None):
+        self.keys = [k.strip() for k in (keys or []) if isinstance(k, str) and k.strip()][:10]
+        self.state_key = state_key
+        self.on_rotate = on_rotate
 
-    def current(self) -> str:
-        if not self.keys:
-            return ""
-        return self.keys[self._idx]
+        idx = st.session_state.get(state_key, 0)
+        self.idx = 0 if not self.keys else (idx % len(self.keys))
+        st.session_state[state_key] = self.idx
 
-    def rotate(self) -> str:
+    def current(self):
+        return self.keys[self.idx % len(self.keys)] if self.keys else None
+
+    def rotate(self):
         if not self.keys:
-            return ""
-        self._idx = (self._idx + 1) % len(self.keys)
-        return self.current()
+            return
+        self.idx = (self.idx + 1) % len(self.keys)
+        st.session_state[self.state_key] = self.idx
+        if callable(self.on_rotate):
+            self.on_rotate(self.idx, self.current())
 
 class RotatingYouTube:
-    def __init__(self, keys: List[str], idx_seed: str = "yt"):
-        self.rot = RotatingKeys(keys, idx_seed=idx_seed)
+    def __init__(self, keys, state_key="yt_key_idx"):
+        self.rot = RotatingKeys(keys, state_key)
         self.service = None
         self._build()
 
     def _build(self):
         key = self.rot.current()
         if not key:
-            raise RuntimeError("YouTube API Key가 비어 있습니다. (secrets/env 설정 필요)")
+            raise RuntimeError("YouTube API Key가 비어 있습니다.")
         self.service = build("youtube", "v3", developerKey=key)
 
-    def execute(self, factory: Callable):
-        attempts = max(1, len(self.rot.keys))
-        last_err = None
-        for _ in range(attempts):
-            try:
+    def execute(self, factory):
+        try:
+            return factory(self.service).execute()
+        except HttpError as e:
+            status = getattr(getattr(e, 'resp', None), 'status', None)
+            msg = (getattr(e, 'content', b'').decode('utf-8', 'ignore') or '').lower()
+            if status in (403, 429) and any(t in msg for t in ["quota", "rate", "limit"]) and len(YT_API_KEYS) > 1:
+                self.rot.rotate()
+                self._build()
                 return factory(self.service).execute()
-            except HttpError as e:
-                last_err = e
-                status = getattr(e, "status_code", None) or getattr(getattr(e, "resp", None), "status", None)
-                msg = str(e).lower()
-                quota_like = (status in (403, 429)) or ("quota" in msg) or ("rate" in msg) or ("userratelimit" in msg)
-                if quota_like and len(self.rot.keys) > 1:
-                    self.rot.rotate()
-                    self._build()
-                    time.sleep(0.25)
-                    continue
-                raise
-        raise last_err
-
-# endregion
-
-
-# ==========================================================
-# region [6. Gemini Helpers]
-# ==========================================================
-def _configure_genai(api_key: str):
-    genai.configure(api_key=api_key)
-
-def call_gemini_rotating(model_name: str, keys: List[str], system_prompt: Optional[str], user_prompt: str,
-                        max_output_tokens: int, temperature: float = 0.3) -> str:
-    if not keys:
-        raise RuntimeError("Gemini API Key가 비어 있습니다. (secrets/env 설정 필요)")
-    rk = RotatingKeys(keys, idx_seed=f"gem_{model_name}")
-    last_err = None
-    for _ in range(max(1, len(rk.keys))):
-        try:
-            _configure_genai(rk.current())
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                system_instruction=system_prompt if system_prompt else None,
-            )
-            resp = model.generate_content(
-                user_prompt,
-                generation_config={"temperature": temperature, "max_output_tokens": max_output_tokens},
-                safety_settings={
-                    "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
-                    "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
-                    "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
-                    "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
-                },
-                request_options={"timeout": GEMINI_TIMEOUT},
-            )
-            txt = (getattr(resp, "text", "") or "").strip()
-            if txt:
-                return txt
-            try:
-                return (resp.candidates[0].content.parts[0].text or "").strip()
-            except Exception:
-                return ""
-        except Exception as e:
-            last_err = e
-            msg = str(e).lower()
-            if ("429" in msg or "quota" in msg or "rate" in msg) and len(rk.keys) > 1:
-                rk.rotate()
-                time.sleep(0.25)
-                continue
             raise
-    raise last_err
-
 # endregion
 
-
-# ==========================================================
-# region [7. Prompt Load & HTML Report Extraction]
-# ==========================================================
-def load_prompt_file(path: str) -> str:
-    try:
-        if os.path.exists(path):
-            return open(path, "r", encoding="utf-8").read()
-    except Exception:
-        pass
-    try:
-        base = os.path.dirname(__file__)  # type: ignore
-        cand = os.path.join(base, path)
-        if os.path.exists(cand):
-            return open(cand, "r", encoding="utf-8").read()
-    except Exception:
-        pass
-    return ""
-
-def extract_report_html(text: str) -> Optional[str]:
-    if not text:
-        return None
-    s = text.strip()
-    s = re.sub(r"```html\s*|```", "", s, flags=re.I)
-    m = re.search(r"<!--\s*REPORT_START\s*-->(.*?)<!--\s*REPORT_END\s*-->", s, flags=re.S | re.I)
-    if not m:
-        if "<div" in s and "</div>" in s:
-            return s.strip()
-        return None
-    body = m.group(1).strip()
-    body = "\n".join([ln.lstrip("\t ") for ln in body.splitlines()])
-    return body.strip() if body else None
-
-# endregion
-
-
-# ==========================================================
-# region [8. Light Schema Parsing]
-# ==========================================================
-LIGHT_PROMPT = r"""
-너는 사용자의 자연어 요청을 'YouTube 댓글 수집/분석 스키마'로 변환하는 파서다.
-아래 출력 포맷을 반드시 지켜라(6줄 고정). 날짜/시간은 KST 기준.
-- 기간이 명확하지 않으면 최근 24시간으로 설정.
-- 키워드는 핵심 1개(가장 중요한 것)만.
-- 엔티티는 보조(작품/인물/채널/이슈 등) 0~3개.
-- 옵션 include_replies: true/false만.
-
-[출력 포맷]
-start_kst: YYYY-MM-DD HH:MM:SS
-end_kst:   YYYY-MM-DD HH:MM:SS
-keywords:  <키워드 1개>
-entities:  <엔티티1>, <엔티티2>, <엔티티3>
-include_replies: true|false
-note: <짧은 메모>
-
-[사용자 요청]
-{USER_QUERY}
-""".strip()
-
-def parse_light_block_to_schema(text: str) -> Dict:
-    out = {"start_iso": "", "end_iso": "", "keywords": [], "entities": [], "options": {"include_replies": True}, "note": ""}
-    if not text:
-        end_dt = now_kst()
-        start_dt = end_dt - timedelta(hours=24)
-        out["start_iso"] = to_iso_kst(start_dt)
-        out["end_iso"] = to_iso_kst(end_dt)
-        return out
-
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    kv = {}
-    for ln in lines:
-        if ":" in ln:
-            k, v = ln.split(":", 1)
-            kv[k.strip().lower()] = v.strip()
-
-    def _parse_dt(v: str) -> datetime:
-        v = v.strip()
-        try:
-            return datetime.strptime(v, "%Y-%m-%d %H:%M:%S").replace(tzinfo=KST)
-        except Exception:
-            pass
-        try:
-            return datetime.fromisoformat(v).astimezone(KST)
-        except Exception:
-            return now_kst()
-
-    end_dt = _parse_dt(kv.get("end_kst", "")) if kv.get("end_kst") else now_kst()
-    start_dt = _parse_dt(kv.get("start_kst", "")) if kv.get("start_kst") else (end_dt - timedelta(hours=24))
-    if start_dt > end_dt:
-        start_dt = end_dt - timedelta(hours=24)
-
-    kw = kv.get("keywords", "").strip()
-    entities = kv.get("entities", "").strip()
-    inc = kv.get("include_replies", "true").strip().lower()
-
-    out["start_iso"] = to_iso_kst(start_dt)
-    out["end_iso"] = to_iso_kst(end_dt)
-    out["keywords"] = [kw] if kw else []
-    out["entities"] = [e.strip() for e in entities.split(",") if e.strip()] if entities else []
-    out["options"]["include_replies"] = (inc == "true")
-    out["note"] = kv.get("note", "")
-    return out
-
-# endregion
-
-
-# ==========================================================
-# region [9. Cache Loader (ytan cache_token_*.json)]
-# ==========================================================
-def normalize_text(s: str) -> str:
-    return re.sub(r"\s+", "", (s or "")).lower()
-
-def scan_cache_files(cache_dir: str) -> List[str]:
-    try:
-        if not cache_dir or not os.path.exists(cache_dir):
-            return []
-        files = []
-        for fn in os.listdir(cache_dir):
-            if fn.startswith("cache_token_") and fn.endswith(".json"):
-                files.append(os.path.join(cache_dir, fn))
-        return sorted(files)
-    except Exception:
-        return []
-
-def load_cache_videos(cache_paths: List[str]) -> List[Dict]:
-    videos: List[Dict] = []
-    for p in cache_paths:
-        try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict) and "videos" in data and isinstance(data["videos"], list):
-                for v in data["videos"]:
-                    if not isinstance(v, dict):
-                        continue
-                    vid = v.get("id") or v.get("video_id") or ""
-                    if not vid:
-                        continue
-                    videos.append({
-                        "id": vid,
-                        "title": v.get("title", "") or "",
-                        "date": v.get("date") or v.get("publishedAt") or "",
-                        "description": v.get("description", "") or "",
-                    })
-            elif isinstance(data, list):
-                for v in data:
-                    if not isinstance(v, dict):
-                        continue
-                    vid = v.get("id") or v.get("video_id") or ""
-                    if not vid:
-                        continue
-                    videos.append({
-                        "id": vid,
-                        "title": v.get("title", "") or "",
-                        "date": v.get("date") or v.get("publishedAt") or "",
-                        "description": v.get("description", "") or "",
-                    })
-        except Exception:
-            continue
-
-    seen = set()
-    out = []
-    for v in videos:
-        if v["id"] in seen:
-            continue
-        out.append(v); seen.add(v["id"])
-    return out
-
-def filter_pgc_ids_from_cache(videos: List[Dict], keyword: str, start_dt: datetime, end_dt: datetime) -> List[str]:
-    nk = normalize_text(keyword)
-    if not nk:
-        return []
-    ids = []
-    for v in videos:
-        title = normalize_text(v.get("title", ""))
-        desc = normalize_text(v.get("description", ""))
-        if nk not in title and nk not in desc:
-            continue
-        v_dt = parse_utc_to_kst(v.get("date", ""))
-        if start_dt.date() <= v_dt.date() <= end_dt.date():
-            ids.append(v["id"])
-    return list(dict.fromkeys(ids))
-
-# endregion
-
-
-# ==========================================================
-# region [10. GitHub Cache Sync (optional)]
-# ==========================================================
-def _gh_headers(token: str) -> Dict[str, str]:
-    # Fine-grained PAT은 Bearer 방식을 요구하는 경우가 많아 Bearer를 기본으로 사용
+# region [GitHub & Session Management]
+def _gh_headers(token: str):
+    # Fine-grained PAT 호환을 위해 Bearer 우선
+    auth = f"Bearer {token}" if token else ""
     return {
-        "Authorization": f"Bearer {token}",
+        "Authorization": auth,
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "ytcc-cache-sync",
+        "User-Agent": "ytcc-chatbot"
     }
 
-def github_list_dir(repo: str, branch: str, path_in_repo: str, token: str) -> List[Dict]:
-    # GitHub Contents API: path는 URL 인코딩 필요(공백/한글 등 대비)
-    safe_path = quote((path_in_repo or "").strip("/"))
-    url = f"https://api.github.com/repos/{repo}/contents/{safe_path}?ref={branch}"
-    r = requests.get(url, headers=_gh_headers(token))
-    if r.status_code != 200:
-        # Streamlit Cloud에서 r.text를 그대로 던지면 redaction이 걸려 디버깅이 어려움.
-        # message만 안전하게 추출해서 에러로 올림.
-        msg = ""
-        try:
-            j = r.json()
-            if isinstance(j, dict):
-                msg = j.get("message", "") or ""
-        except Exception:
-            msg = ""
-        hint = ""
-        if r.status_code in (401,):
-            hint = " (401: 토큰이 없거나 권한/형식이 잘못됨 — Fine-grained PAT이면 repo 권한과 Bearer 형식 확인)"
-        elif r.status_code in (403,):
-            hint = " (403: 권한 부족 또는 rate limit — repo 접근 권한/limit 확인)"
-        elif r.status_code in (404,):
-            hint = " (404: repo/경로/브랜치가 틀림 — CACHE_GITHUB_REPO/PATH/BRANCH 확인)"
-        raise RuntimeError(f"GitHub 목록 실패: {r.status_code} {msg}{hint}")
-    data = r.json()
-    return data if isinstance(data, list) else []
+def github_upload_file(repo, branch, path_in_repo, local_path, token):
+    url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}"
+    with open(local_path, "rb") as f:
+        content = base64.b64encode(f.read()).decode()
 
-def github_download_file(download_url: str, token: str) -> bytes:
-    r = requests.get(download_url, headers=_gh_headers(token))
-    if r.status_code != 200:
-        msg = ""
-        try:
-            j = r.json()
-            if isinstance(j, dict):
-                msg = j.get("message", "") or ""
-        except Exception:
-            msg = ""
-        raise RuntimeError(f"GitHub 다운로드 실패: {r.status_code} {msg}")
-    return r.content
+    headers = _gh_headers(token)
+    get_resp = requests.get(url + f"?ref={branch}", headers=headers)
+    sha = get_resp.json().get("sha") if get_resp.ok else None
 
-def sync_cache_from_github(cache_dir: str) -> Tuple[bool, str, List[str]]:
+    data = {
+        "message": f"archive: {os.path.basename(path_in_repo)}",
+        "content": content,
+        "branch": branch
+    }
+    if sha:
+        data["sha"] = sha
+
+    resp = requests.put(url, headers=headers, json=data)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def github_list_items(repo: str, branch: str, path_in_repo: str, token: str):
+    """GitHub Contents API로 폴더(또는 루트) 내 항목 목록을 가져옵니다.
+    - path_in_repo가 "" / "." 이면 루트를 조회합니다.
+    """
+    from urllib.parse import quote
+    p = (path_in_repo or "").strip()
+    if p in ("", ".", "/"):
+        url = f"https://api.github.com/repos/{repo}/contents?ref={branch}"
+    else:
+        url = f"https://api.github.com/repos/{repo}/contents/{quote(p)}?ref={branch}"
+    resp = requests.get(url, headers=_gh_headers(token))
+    if not resp.ok:
+        return None, f"{resp.status_code} {resp.json().get('message', '') if resp.headers.get('content-type','').startswith('application/json') else resp.text}"
+    data = resp.json()
+    if isinstance(data, dict):
+        # 파일 1개를 가리키는 경우
+        return [data], ""
+    if isinstance(data, list):
+        return data, ""
+    return [], ""
+
+def github_list_dir(repo, branch, folder, token):
+    url = f"https://api.github.com/repos/{repo}/contents/{folder}?ref={branch}"
+    resp = requests.get(url, headers=_gh_headers(token))
+    if resp.ok:
+        return [item['name'] for item in resp.json() if item['type'] == 'dir']
+    return []
+
+def github_download_file(repo, branch, path_in_repo, token, local_path):
+    url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}?ref={branch}"
+    resp = requests.get(url, headers=_gh_headers(token))
+    if resp.ok:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        with open(local_path, "wb") as f:
+            f.write(base64.b64decode(resp.json()["content"]))
+        return True
+    return False
+
+
+# region [PGC Cache: Auto Sync & Search]
+def _cache_local_dir() -> str:
+    d = os.path.join(BASE_DIR, "pgc_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def sync_pgc_cache_from_github(force: bool = False):
+    """자사(PGC) 캐시 레포에서 cache_token_*.json을 로컬로 동기화.
+    - UI 버튼 없이, 자사모드 토글 ON 순간에 1회 자동 실행되는 것을 기본으로 함.
+    """
     if not (CACHE_GITHUB_TOKEN and CACHE_GITHUB_REPO):
-        return False, "CACHE_GITHUB_TOKEN / CACHE_GITHUB_REPO 설정이 없습니다.", []
-    os.makedirs(cache_dir, exist_ok=True)
-    items = github_list_dir(CACHE_GITHUB_REPO, CACHE_GITHUB_BRANCH, CACHE_GITHUB_PATH, CACHE_GITHUB_TOKEN)
-    picked = [it for it in items if it.get("type") == "file" and str(it.get("name", "")).startswith("cache_token_") and str(it.get("name", "")).endswith(".json")]
-    if not picked:
-        return False, f"경로({CACHE_GITHUB_PATH})에서 cache_token_*.json 파일을 찾지 못했습니다.", []
+        st.session_state["own_ip_cache_error"] = "CACHE_GITHUB_TOKEN / CACHE_GITHUB_REPO 설정이 없습니다."
+        st.session_state["own_ip_cache_synced"] = False
+        return False, st.session_state["own_ip_cache_error"], []
+
+    if (not force) and st.session_state.get("own_ip_cache_synced"):
+        return True, "already-synced", []
+
+    cache_dir = _cache_local_dir()
+
+    items, err = github_list_items(CACHE_GITHUB_REPO, CACHE_GITHUB_BRANCH, CACHE_GITHUB_PATH, CACHE_GITHUB_TOKEN)
+    if items is None:
+        st.session_state["own_ip_cache_error"] = f"GitHub 캐시 목록 실패: {err}"
+        st.session_state["own_ip_cache_synced"] = False
+        return False, st.session_state["own_ip_cache_error"], []
+
+    wanted = []
+    for it in items:
+        if it.get("type") != "file":
+            continue
+        name = it.get("name", "")
+        if re.fullmatch(r"cache_token_.*\.json", name):
+            wanted.append(it)
 
     saved = []
-    for it in picked:
-        b = github_download_file(it.get("download_url", ""), CACHE_GITHUB_TOKEN)
-        local_path = os.path.join(cache_dir, it.get("name", f"cache_{len(saved)}.json"))
-        with open(local_path, "wb") as f:
-            f.write(b)
-        saved.append(local_path)
-    return True, f"캐시 {len(saved)}개 다운로드 완료", saved
+    for it in wanted:
+        path = it.get("path", "")
+        local_path = os.path.join(cache_dir, os.path.basename(path))
+        ok = github_download_file(CACHE_GITHUB_REPO, CACHE_GITHUB_BRANCH, path, CACHE_GITHUB_TOKEN, local_path)
+        if ok:
+            saved.append(local_path)
 
-# endregion
+    st.session_state["own_ip_cache_synced"] = True
+    st.session_state["own_ip_cache_last_sync"] = to_iso_kst(now_kst())
+    st.session_state["own_ip_cache_error"] = None
+    return True, f"synced {len(saved)} file(s)", saved
 
+def _extract_vid_from_cache_item(obj):
+    """캐시 JSON 내부 구조가 달라도 최대한 video_id를 뽑아냅니다."""
+    if not isinstance(obj, dict):
+        return None, None, None
+    vid = obj.get("video_id") or obj.get("videoId") or obj.get("id") or obj.get("videoId ")
+    title = obj.get("title") or (obj.get("snippet") or {}).get("title") or ""
+    desc = obj.get("description") or (obj.get("snippet") or {}).get("description") or ""
+    return (vid, title or "", desc or "")
 
-# ==========================================================
-# region [11. Video ID Sourcing]
-# ==========================================================
-def extract_video_ids_from_text(text: str) -> List[str]:
-    if not text:
+def load_pgc_video_ids_by_keyword(keyword: str):
+    """로컬 캐시 JSON에서 keyword로 PGC 영상 후보(video_id) 찾기 (키워드만 기준)."""
+    keyword = (keyword or "").strip()
+    if not keyword:
         return []
-    ids = []
-    for m in re.finditer(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", text):
-        ids.append(m.group(1))
-    for m in re.finditer(r"\b([A-Za-z0-9_-]{11})\b", text):
-        ids.append(m.group(1))
-    out = []
-    for vid in ids:
-        if vid not in out:
-            out.append(vid)
-    return out
 
-def yt_search_videos(rt: RotatingYouTube, keyword: str, max_results: int,
-                     order: str = "relevance",
-                     published_after: Optional[str] = None,
-                     published_before: Optional[str] = None) -> List[Dict]:
-    items, token = [], None
-    while len(items) < max_results:
-        params = {"q": keyword, "part": "snippet", "type": "video", "order": order, "maxResults": min(50, max_results - len(items))}
-        if published_after:
-            params["publishedAfter"] = published_after
-        if published_before:
-            params["publishedBefore"] = published_before
-        if token:
-            params["pageToken"] = token
+    cache_dir = _cache_local_dir()
+    files = []
+    for fn in os.listdir(cache_dir):
+        if re.fullmatch(r"cache_token_.*\.json", fn):
+            files.append(os.path.join(cache_dir, fn))
 
-        resp = rt.execute(lambda s: s.search().list(**params))
-        for it in resp.get("items", []):
-            vid = it.get("id", {}).get("videoId", "")
-            sn = it.get("snippet", {}) or {}
-            if not vid:
+    vids = []
+    kw_low = keyword.lower()
+    for fp in files:
+        try:
+            with open(fp, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+
+        # data 형태가 list / dict 모두 대응
+        candidates = []
+        if isinstance(data, list):
+            candidates = data
+        elif isinstance(data, dict):
+            if isinstance(data.get("videos"), list):
+                candidates = data.get("videos", [])
+            elif isinstance(data.get("items"), list):
+                candidates = data.get("items", [])
+            else:
+                # dict 자체가 1개 영상일 수도
+                candidates = [data]
+
+        for it in candidates:
+            vid, title, desc = _extract_vid_from_cache_item(it)
+            if not vid or not YTB_ID_RE.fullmatch(str(vid)):
                 continue
-            items.append({"video_id": vid, "title": sn.get("title", ""), "channel_id": sn.get("channelId", ""), "published_at": sn.get("publishedAt", "")})
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-        time.sleep(0.2)
+            hay = f"{title} {desc}".lower()
+            if kw_low in hay:
+                vids.append(str(vid))
 
-    seen = set()
-    out = []
-    for it in items:
-        if it["video_id"] not in seen:
-            out.append(it); seen.add(it["video_id"])
-    return out
-
-def build_video_pool(schema: Dict, own_ip_enabled: bool, cache_videos: List[Dict], extra_video_ids: Optional[List[str]] = None) -> Tuple[List[str], Dict]:
-    extra_video_ids = list(dict.fromkeys(extra_video_ids or []))
-    start_dt = datetime.fromisoformat(schema["start_iso"]).astimezone(KST)
-    end_dt = datetime.fromisoformat(schema["end_iso"]).astimezone(KST)
-    kw = (schema.get("keywords") or [""])[0].strip()
-
-    published_after = kst_to_rfc3339_utc(start_dt)
-    published_before = kst_to_rfc3339_utc(end_dt)
-    rt = RotatingYouTube(YT_API_KEYS, idx_seed="yt_search")
-
-    if own_ip_enabled:
-        if not cache_videos:
-            raise RuntimeError("자사 IP 모드 ON: cache_token_*.json 캐시가 없습니다. (캐시 업로드/동기화 후 다시 시도)")
-        pgc_ids = filter_pgc_ids_from_cache(cache_videos, kw, start_dt, end_dt)
-        if not pgc_ids:
-            raise RuntimeError("자사 IP 모드 ON: 캐시에서 해당 키워드/기간의 자사(PGC) 영상을 찾지 못했습니다. (키워드/기간 확인)")
-
-        ugc_ids = []
-        if kw:
-            hits = yt_search_videos(rt, kw, max_results=200, order="relevance", published_after=published_after, published_before=published_before)
-            for h in hits:
-                if h["video_id"] in pgc_ids:
-                    continue
-                if OST_EXCLUDE_RE.search(h.get("title", "") or ""):
-                    continue
-                ugc_ids.append(h["video_id"])
-            ugc_ids = list(dict.fromkeys(ugc_ids))
-
-        video_ids = list(dict.fromkeys(pgc_ids + ugc_ids + extra_video_ids))
-        return video_ids, {"mode": "own_ip_cache", "pgc_count": len(pgc_ids), "ugc_count": len(ugc_ids),
-                           "published_after": published_after, "published_before": published_before}
-
-    # legacy search
-    base_queries = []
-    if kw:
-        base_queries.append(kw)
-        for e in (schema.get("entities") or [])[:3]:
-            if e.strip():
-                base_queries.extend([f"{kw} {e.strip()}", f"{e.strip()} {kw}"])
-    else:
-        base_queries.append("유튜브")
-
-    all_hits = []
-    for q in base_queries:
-        all_hits.extend(yt_search_videos(rt, q, max_results=120, order="relevance", published_after=published_after, published_before=published_before))
-    all_ids = [h["video_id"] for h in all_hits]
-    video_ids = list(dict.fromkeys(all_ids + extra_video_ids))
-    return video_ids, {"mode": "search", "pgc_count": 0, "ugc_count": 0, "published_after": published_after, "published_before": published_before}
-
+    # 중복 제거
+    return list(dict.fromkeys(vids))
 # endregion
 
 
-# ==========================================================
-# region [12. Video Statistics]
-# ==========================================================
-def yt_video_statistics(rt: RotatingYouTube, video_ids: List[str]) -> List[Dict]:
-    out = []
-    for i in range(0, len(video_ids), 50):
-        chunk = video_ids[i:i+50]
-        resp = rt.execute(lambda s: s.videos().list(part="snippet,statistics", id=",".join(chunk), maxResults=50))
-        for it in resp.get("items", []):
-            vid = it.get("id", "")
-            sn = it.get("snippet", {}) or {}
-            stt = it.get("statistics", {}) or {}
-            out.append({
-                "video_id": vid,
-                "video_title": sn.get("title", ""),
-                "channel_id": sn.get("channelId", ""),
-                "publishedAt": sn.get("publishedAt", ""),
-                "viewCount": int(stt.get("viewCount", 0) or 0),
-                "likeCount": int(stt.get("likeCount", 0) or 0),
-                "commentCount": int(stt.get("commentCount", 0) or 0),
+def github_delete_folder(repo, branch, folder_path, token):
+    contents_url = f"https://api.github.com/repos/{repo}/contents/{folder_path}?ref={branch}"
+    headers = _gh_headers(token)
+    resp = requests.get(contents_url, headers=headers)
+    if not resp.ok:
+        return
+    for item in resp.json():
+        delete_url = f"https://api.github.com/repos/{repo}/contents/{item['path']}"
+        data = {"message": f"delete: {item['name']}", "sha": item['sha'], "branch": branch}
+        requests.delete(delete_url, headers=headers, json=data).raise_for_status()
+
+def github_rename_session(old_name, new_name, token):
+    contents_url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/sessions/{old_name}?ref={GITHUB_BRANCH}"
+    resp = requests.get(contents_url, headers=_gh_headers(token))
+    resp.raise_for_status()
+    files_to_move = resp.json()
+
+    for item in files_to_move:
+        filename = item['name']
+        local_path = os.path.join(SESS_DIR, filename)
+        if not github_download_file(GITHUB_REPO, GITHUB_BRANCH, item['path'], token, local_path):
+            raise Exception(f"Failed to download {filename} from {old_name}")
+        github_upload_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{new_name}/{filename}", local_path, token)
+
+    github_delete_folder(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{old_name}", token)
+
+def _build_session_name() -> str:
+    if st.session_state.get("loaded_session_name"):
+        return st.session_state.loaded_session_name
+
+    schema = st.session_state.get("last_schema", {})
+    kw = (schema.get("keywords", ["NoKeyword"]))[0]
+    kw_slug = re.sub(r'[^\w-]', '', kw.replace(' ', '_'))[:20]
+    return f"{kw_slug}_{now_kst().strftime('%Y-%m-%d_%H%M')}"
+
+def save_current_session_to_github():
+    if not all([GITHUB_REPO, GITHUB_TOKEN, st.session_state.chat, st.session_state.last_csv]):
+        return False, "저장할 데이터가 없거나 GitHub 설정이 누락되었습니다."
+
+    sess_name = _build_session_name()
+    local_dir = os.path.join(SESS_DIR, sess_name)
+    os.makedirs(local_dir, exist_ok=True)
+
+    try:
+        meta_path = os.path.join(local_dir, "qa.json")
+        meta_data = {
+            "chat": st.session_state.chat,
+            "last_schema": st.session_state.last_schema,
+            "sample_text": st.session_state.sample_text
+        }
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_data, f, ensure_ascii=False, indent=2)
+
+        comments_path = os.path.join(local_dir, "comments.csv")
+        videos_path = os.path.join(local_dir, "videos.csv")
+
+        os.system(f'cp "{st.session_state.last_csv}" "{comments_path}"')
+        if st.session_state.last_df is not None:
+            st.session_state.last_df.to_csv(videos_path, index=False, encoding="utf-8-sig")
+
+        github_upload_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/qa.json", meta_path, GITHUB_TOKEN)
+        github_upload_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/comments.csv", comments_path, GITHUB_TOKEN)
+        if os.path.exists(videos_path):
+            github_upload_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/videos.csv", videos_path, GITHUB_TOKEN)
+
+        st.session_state.loaded_session_name = sess_name
+        return True, sess_name
+
+    except Exception as e:
+        return False, f"저장 실패: {e}"
+
+def load_session_from_github(sess_name: str):
+    with st.spinner(f"세션 '{sess_name}' 불러오는 중..."):
+        try:
+            local_dir = os.path.join(SESS_DIR, sess_name)
+            qa_ok = github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/qa.json", GITHUB_TOKEN, os.path.join(local_dir, "qa.json"))
+            comments_ok = github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/comments.csv", GITHUB_TOKEN, os.path.join(local_dir, "comments.csv"))
+            videos_ok = github_download_file(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}/videos.csv", GITHUB_TOKEN, os.path.join(local_dir, "videos.csv"))
+
+            if not (qa_ok and comments_ok):
+                st.error("세션 핵심 파일을 불러오는 데 실패했습니다.")
+                return
+
+            st.session_state.clear()
+            ensure_state()
+
+            with open(os.path.join(local_dir, "qa.json"), "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            st.session_state.update({
+                "chat": meta.get("chat", []),
+                "last_schema": meta.get("last_schema", None),
+                "last_csv": os.path.join(local_dir, "comments.csv"),
+                "last_df": pd.read_csv(os.path.join(local_dir, "videos.csv")) if videos_ok and os.path.exists(os.path.join(local_dir, "videos.csv")) else pd.DataFrame(),
+                "loaded_session_name": sess_name,
+                "sample_text": meta.get("sample_text", "")
             })
-        time.sleep(0.1)
-    return out
+        except Exception as e:
+            st.error(f"세션 로드 실패: {e}")
 
+# 세션 로드/삭제/이름변경 트리거 처리
+if 'session_to_load' in st.session_state:
+    load_session_from_github(st.session_state.pop('session_to_load'))
+    st.rerun()
+
+if 'session_to_delete' in st.session_state:
+    sess_name = st.session_state.pop('session_to_delete')
+    with st.spinner(f"세션 '{sess_name}' 삭제 중..."):
+        github_delete_folder(GITHUB_REPO, GITHUB_BRANCH, f"sessions/{sess_name}", GITHUB_TOKEN)
+    st.success("세션 삭제 완료.")
+    time.sleep(1)
+    st.rerun()
+
+if 'session_to_rename' in st.session_state:
+    old, new = st.session_state.pop('session_to_rename')
+    if old and new and old != new:
+        with st.spinner("이름 변경 중..."):
+            try:
+                github_rename_session(old, new, GITHUB_TOKEN)
+                st.success("이름 변경 완료!")
+            except Exception as e:
+                st.error(f"변경 실패: {e}")
+        time.sleep(1)
+        st.rerun()
 # endregion
 
-
-# ==========================================================
-# region [13. Deep Comment Collection (NO caps)]
-# ==========================================================
-def yt_all_replies(rt: RotatingYouTube, parent_id: str) -> List[Dict]:
-    replies, token = [], None
-    while True:
-        try:
-            resp = rt.execute(lambda s: s.comments().list(part="snippet", parentId=parent_id, maxResults=100, pageToken=token, textFormat="plainText"))
-        except HttpError:
-            break
-        for c in resp.get("items", []):
-            sn = c.get("snippet", {}) or {}
-            replies.append({"comment_id": c.get("id", ""), "parent_id": parent_id, "isReply": 1,
-                            "author": sn.get("authorDisplayName", ""), "text": sn.get("textDisplay", "") or "",
-                            "publishedAt": sn.get("publishedAt", ""), "likeCount": int(sn.get("likeCount", 0) or 0)})
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-        time.sleep(0.15)
-    return replies
-
-def yt_all_comments_sync(rt: RotatingYouTube, video_id: str, title: str = "", include_replies: bool = True) -> List[Dict]:
-    rows, token = [], None
-    while True:
-        try:
-            resp = rt.execute(lambda s: s.commentThreads().list(
-                part="snippet,replies" if include_replies else "snippet",
-                videoId=video_id,
-                maxResults=100,
-                pageToken=token,
-                textFormat="plainText",
-                order="time",
-            ))
-        except HttpError:
-            break
-
-        for it in resp.get("items", []):
-            top = (it.get("snippet", {}) or {}).get("topLevelComment", {}).get("snippet", {}) or {}
-            thread_id = (it.get("snippet", {}) or {}).get("topLevelComment", {}).get("id", "")
-            rows.append({"video_id": video_id, "video_title": title, "comment_id": thread_id, "parent_id": "", "isReply": 0,
-                         "author": top.get("authorDisplayName", ""), "text": top.get("textDisplay", "") or "",
-                         "publishedAt": top.get("publishedAt", ""), "likeCount": int(top.get("likeCount", 0) or 0)})
-            if include_replies:
-                total_reply = int((it.get("snippet", {}) or {}).get("totalReplyCount", 0) or 0)
-                if total_reply > 0:
-                    rows.extend([{"video_id": video_id, "video_title": title, **r} for r in yt_all_replies(rt, thread_id)])
-
-        token = resp.get("nextPageToken")
-        if not token:
-            break
-        time.sleep(0.15)
-    return rows
-
-def parallel_collect_comments_streaming(video_rows: List[Dict], include_replies: bool, progress_bar=None) -> Tuple[str, int]:
-    run_id = now_kst().strftime("%Y%m%d_%H%M%S") + "_" + hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
-    csv_path = os.path.join(SESS_DIR, f"comments_{run_id}.csv")
-    fieldnames = ["video_id", "video_title", "comment_id", "parent_id", "isReply", "author", "text", "publishedAt", "likeCount"]
-
-    def _task(v: Dict) -> Tuple[str, int, List[Dict]]:
-        vid = v["video_id"]
-        title = v.get("video_title", "")
-        rt_local = RotatingYouTube(YT_API_KEYS, idx_seed=f"yt_{vid}")
-        rows = yt_all_comments_sync(rt_local, vid, title=title, include_replies=include_replies)
-        return vid, len(rows), rows
-
-    total = 0
-    done = 0
-    n = len(video_rows)
-
-    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-        max_workers = min(4, max(1, (os.cpu_count() or 2) // 2))
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = [ex.submit(_task, v) for v in video_rows]
-            for fu in as_completed(futures):
-                _, cnt, rows = fu.result()
-                for r in rows:
-                    writer.writerow(r)
-                total += cnt
-                done += 1
-                if progress_bar:
-                    progress_bar.progress(min(0.85, done / n * 0.85), text=f"댓글 수집중… ({done}/{n}개 영상 완료, 누적 {total:,}개)")
-    return csv_path, total
-
-# endregion
-
-
-# ==========================================================
-# region [14. Sampling for LLM (ytcc 유지)]
-# ==========================================================
-def serialize_comments_for_llm_from_file(csv_path: str, max_chars_per_comment: int = 280, max_total_chars: int = 420_000) -> Tuple[str, int, int]:
+# region [Data Processing & Utils]
+def serialize_comments_for_llm_from_file(csv_path: str,
+                                         max_chars_per_comment=280,
+                                         max_total_chars=420_000):
     if not os.path.exists(csv_path):
         return "", 0, 0
-    df_all = pd.read_csv(csv_path)
+    try:
+        df_all = pd.read_csv(csv_path)
+    except Exception:
+        return "", 0, 0
     if df_all.empty:
         return "", 0, 0
 
     df_top_likes = df_all.sort_values("likeCount", ascending=False).head(1000)
     df_remaining = df_all.drop(df_top_likes.index)
     df_random = df_remaining.sample(n=min(1000, len(df_remaining))) if not df_remaining.empty else pd.DataFrame()
-    df = pd.concat([df_top_likes, df_random], ignore_index=True)
 
+    df_sample = pd.concat([df_top_likes, df_random])
     lines, total_chars = [], 0
-    for _, r in df.iterrows():
-        text = str(r.get("text", "") or "").replace("\n", " ").strip()
-        if not text:
-            continue
+
+    for _, r in df_sample.iterrows():
+        if total_chars >= max_total_chars:
+            break
+
+        text = str(r.get("text", "") or "").replace("\n", " ")
         prefix = f"[{'R' if int(r.get('isReply', 0)) == 1 else 'T'}|♥{int(r.get('likeCount', 0))}] "
         author_clean = str(r.get('author', '')).replace('\n', ' ')
+        prefix += f"{author_clean}: "
         body = text[:max_chars_per_comment] + '…' if len(text) > max_chars_per_comment else text
-        line = prefix + f"{author_clean}: " + body
+
+        line = prefix + body
         if total_chars + len(line) + 1 > max_total_chars:
             break
+
         lines.append(line)
         total_chars += len(line) + 1
 
     return "\n".join(lines), len(lines), total_chars
 
+def tidy_answer(md: str) -> str:
+    """
+    AI 답변 상단에 불필요하게 붙는 '유튜브 댓글 분석 결과' 같은 제목만 제거하고,
+    나머지 마크다운 헤더(###)는 살려둡니다. (마크다운 파괴 방지)
+    """
+    if not md:
+        return ""
+    
+    lines = md.splitlines()
+    cleaned = []
+    
+    # "유튜브 댓글 분석" 같은 뻔한 제목만 지우기 위한 정규식
+    REMOVE_PATTERN = re.compile(r"유튜브\s*댓글\s*분석|보고서\s*작성|분석\s*결과", re.IGNORECASE)
+
+    for line in lines:
+        if not line.strip():
+            cleaned.append(line)
+            continue
+            
+        # 1. 뻔한 제목이 포함된 줄이면 스킵 (내용이 긴 문장은 제외)
+        if REMOVE_PATTERN.search(line) and len(line) < 50:
+            continue
+            
+        # 2. 그 외의 정상적인 내용(소제목 포함)은 보존
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip()
+
+YTB_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+
+def extract_video_ids_from_text(text: str) -> list:
+    if not text:
+        return []
+    ids = set()
+    for m in re.finditer(r"https?://youtu\.be/([A-Za-z0-9_-]{11})", text):
+        ids.add(m.group(1))
+    for m in re.finditer(r"https?://(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})", text):
+        ids.add(m.group(1))
+    for m in re.finditer(r"https?://(?:www\.)?youtube\.com/watch\?[^ \n]+", text):
+        url = m.group(0)
+        try:
+            qs = dict((kv.split("=", 1) + [""])[:2] for kv in url.split("?", 1)[1].split("&"))
+            v = qs.get("v", "")
+            if YTB_ID_RE.fullmatch(v):
+                ids.add(v)
+        except Exception:
+            pass
+    return list(ids)
+
+def strip_urls(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"https?://\S+", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 # endregion
 
+# region [API Integrations: Gemini & YouTube]
+# ==============================================================================
+# [Gemini 호출 함수] - 안전 필터 해제, 에러 핸들링, 디버깅 로그 강화
+# ==============================================================================
+def call_gemini_rotating(model_name, keys, system_instruction, user_payload,
+                         timeout_s=120, max_tokens=2048) -> str:
+    rk = RotatingKeys(keys, "gem_key_idx")
+    if not rk.current():
+        raise RuntimeError("Gemini API Key가 비어 있습니다.")
 
-# ==========================================================
-# region [15. Follow-up system prompt]
-# ==========================================================
-def system_prompt_followup() -> str:
-    return (
-        "너는 유튜브 댓글 데이터(샘플)에 근거해 질문에 답하는 대화형 분석가다.\n"
-        "답변은 자연스럽고 대화체로, 한국어로 써라.\n\n"
-        "[공통 규칙]\n"
-        "1) OST/가수/음원/노래 관련 언급은 분석에서 완전 제외(언급하지도 말 것).\n"
-        "2) 욕설/비속어/비하는 반드시 ***로 마스킹.\n"
-        "3) 댓글 원문은 길게 붙이지 말고, 필요할 때만 짧게 1~3개 예시로 제시.\n"
-        "4) 추정은 '가능성/경향'으로 표현하고, 확정적으로 단정하지 말 것.\n"
-        "5) 사용자 질문 범위를 벗어나지 말고, 데이터(샘플)에서 근거를 잡아라.\n"
+    # [핵심] system_instruction이 빈 문자열("")이면 None으로 변환 (라이브러리 에러 방지)
+    real_sys_inst = None if (not system_instruction or not system_instruction.strip()) else system_instruction
+
+    # [핵심] 안전 설정 해제 (BLOCK_NONE) - 댓글 분석 시 과도한 차단 방지
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+    safety_settings = {
+        HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    }
+
+    for _ in range(len(rk.keys) or 1):
+        try:
+            genai.configure(api_key=rk.current())
+            model = genai.GenerativeModel(
+                model_name,
+                generation_config={"temperature": 0.2, "max_output_tokens": max_tokens},
+                system_instruction=real_sys_inst 
+            )
+            
+            resp = model.generate_content(
+                user_payload,
+                request_options={"timeout": timeout_s},
+                safety_settings=safety_settings 
+            )
+            
+            # --- 디버깅 로그 (답변 없을 때 원인 파악용) ---
+            if not resp:
+                print("❌ [DEBUG] 응답 객체(resp)가 비어있습니다.")
+                return "⚠️ AI 응답 없음"
+
+            if resp.prompt_feedback:
+                if resp.prompt_feedback.block_reason:
+                    print(f"🛑 [DEBUG] 입력 차단(Prompt Blocked): {resp.prompt_feedback.block_reason}")
+
+            if not resp.candidates:
+                 print("❌ [DEBUG] 생성된 후보군(Candidates)이 0개입니다.")
+            else:
+                finish_reason = resp.candidates[0].finish_reason
+                # 1=STOP(정상), 2=MAX_TOKENS, 3=SAFETY(안전차단), 4=RECITATION
+                if finish_reason != 1: 
+                    print(f"⚠️ [DEBUG] 비정상 종료 발생! 사유 코드: {finish_reason}")
+
+            # 텍스트 추출 시도 (에러 방어)
+            try:
+                if getattr(resp, "text", None):
+                    return resp.text
+            except ValueError:
+                # 텍스트 생성 거부된 경우
+                if resp.prompt_feedback:
+                    blocked_msg = f"⚠️ [AI 답변 차단] 안전 필터 사유: {resp.prompt_feedback}"
+                    print(blocked_msg) 
+                    return blocked_msg 
+            
+            # 후보군(candidate) 직접 파싱 시도
+            if c0 := (getattr(resp, "candidates", None) or [None])[0]:
+                if p0 := (getattr(c0, "content", None) and getattr(c0.content, "parts", None) or [None])[0]:
+                    if hasattr(p0, "text"):
+                        return p0.text
+            
+            return "⚠️ [시스템] AI 답변을 생성하지 못했습니다. (내용 과다 또는 안전 정책 차단)"
+
+        except Exception as e:
+            msg = str(e).lower()
+            if "429" in msg or "quota" in msg:
+                if len(rk.keys) > 1:
+                    rk.rotate()
+                    continue
+            print(f"Gemini API Error: {e}")
+            raise e
+
+    return ""
+
+def yt_search_videos(rt, keyword, max_results, order="relevance",
+                     published_after=None, published_before=None):
+    video_ids, token = [], None
+    while len(video_ids) < max_results:
+        params = {
+            "q": keyword, "part": "id", "type": "video", "order": order,
+            "maxResults": min(50, max_results - len(video_ids))
+        }
+        if published_after: params["publishedAfter"] = published_after
+        if published_before: params["publishedBefore"] = published_before
+        if token: params["pageToken"] = token
+
+        resp = rt.execute(lambda s: s.search().list(**params))
+        video_ids.extend(it["id"]["videoId"] for it in resp.get("items", [])
+                         if it["id"]["videoId"] not in video_ids)
+        if not (token := resp.get("nextPageToken")):
+            break
+        time.sleep(0.25)
+    return video_ids
+
+def yt_video_statistics(rt, video_ids):
+    rows = []
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i+50]
+        if not batch: continue
+
+        resp = rt.execute(lambda s: s.videos().list(part="statistics,snippet,contentDetails", id=",".join(batch)))
+        for item in resp.get("items", []):
+            stats, snip, cont = item.get("statistics", {}), item.get("snippet", {}), item.get("contentDetails", {})
+            dur = cont.get("duration", "")
+            h, m, s = re.search(r"(\d+)H", dur), re.search(r"(\d+)M", dur), re.search(r"(\d+)S", dur)
+            dur_sec = (int(h.group(1))*3600 if h else 0) + (int(m.group(1))*60 if m else 0) + (int(s.group(1)) if s else 0)
+
+            vid_id = item.get("id")
+            rows.append({
+                "video_id": vid_id,
+                "video_url": f"https://www.youtube.com/watch?v={vid_id}",
+                "title": snip.get("title", ""),
+                "channelTitle": snip.get("channelTitle", ""),
+                "publishedAt": snip.get("publishedAt", ""),
+                "duration": dur,
+                "shortType": "Shorts" if dur_sec <= 60 else "Clip",
+                "viewCount": int(stats.get("viewCount", 0) or 0),
+                "likeCount": int(stats.get("likeCount", 0) or 0),
+                "commentCount": int(stats.get("commentCount", 0) or 0)
+            })
+        time.sleep(0.25)
+    return rows
+
+def yt_all_replies(rt, parent_id, video_id, title="", short_type="Clip", cap=None):
+    replies, token = [], None
+    while not (cap is not None and len(replies) >= cap):
+        try:
+            resp = rt.execute(lambda s: s.comments().list(part="snippet", parentId=parent_id, maxResults=100, pageToken=token, textFormat="plainText"))
+        except HttpError: break
+
+        for c in resp.get("items", []):
+            sn = c["snippet"]
+            replies.append({
+                "video_id": video_id, "video_title": title, "shortType": short_type,
+                "comment_id": c.get("id", ""), "parent_id": parent_id, "isReply": 1,
+                "author": sn.get("authorDisplayName", ""), "text": sn.get("textDisplay", "") or "",
+                "publishedAt": sn.get("publishedAt", ""), "likeCount": int(sn.get("likeCount", 0) or 0)
+            })
+        if not (token := resp.get("nextPageToken")): break
+        time.sleep(0.2)
+    return replies[:cap] if cap is not None else replies
+
+def yt_all_comments_sync(rt, video_id, title="", short_type="Clip",
+                         include_replies=True, max_per_video=None):
+    rows, token = [], None
+    while not (max_per_video is not None and len(rows) >= max_per_video):
+        try:
+            resp = rt.execute(lambda s: s.commentThreads().list(part="snippet,replies", videoId=video_id, maxResults=100, pageToken=token, textFormat="plainText"))
+        except HttpError: break
+
+        for it in resp.get("items", []):
+            top = it["snippet"]["topLevelComment"]["snippet"]
+            thread_id = it["snippet"]["topLevelComment"]["id"]
+            rows.append({
+                "video_id": video_id, "video_title": title, "shortType": short_type,
+                "comment_id": thread_id, "parent_id": "", "isReply": 0,
+                "author": top.get("authorDisplayName", ""), "text": top.get("textDisplay", "") or "",
+                "publishedAt": top.get("publishedAt", ""), "likeCount": int(top.get("likeCount", 0) or 0)
+            })
+            if include_replies and int(it["snippet"].get("totalReplyCount", 0) or 0) > 0:
+                cap = None if max_per_video is None else max(0, max_per_video - len(rows))
+                if cap == 0: break
+                rows.extend(yt_all_replies(rt, thread_id, video_id, title, short_type, cap=cap))
+        if not (token := resp.get("nextPageToken")): break
+        time.sleep(0.2)
+    return rows[:max_per_video] if max_per_video is not None else rows
+
+def parallel_collect_comments_streaming(video_list, rt_keys, include_replies,
+                                        max_total_comments, max_per_video, prog_bar):
+    out_csv = os.path.join(BASE_DIR, f"collect_{uuid4().hex}.csv")
+    wrote_header, total_written, done, total_videos = False, 0, 0, len(video_list)
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futures = {
+            ex.submit(yt_all_comments_sync, RotatingYouTube(rt_keys), v["video_id"], v.get("title", ""),
+                      v.get("shortType", "Clip"), include_replies, max_per_video): v for v in video_list
+        }
+        for f in as_completed(futures):
+            try:
+                if comm := f.result():
+                    dfc = pd.DataFrame(comm)
+                    dfc.to_csv(out_csv, index=False, mode="a" if wrote_header else "w", header=not wrote_header, encoding="utf-8-sig")
+                    wrote_header = True
+                    total_written += len(dfc)
+            except Exception: pass
+            done += 1
+            prog_bar.progress(min(0.90, 0.50 + (done / total_videos) * 0.40 if total_videos > 0 else 0.50), text="댓글 수집중…")
+            if total_written >= max_total_comments: break
+    return out_csv, total_written
+# endregion
+
+# region [UI Components]
+def scroll_to_bottom():
+    st_html(
+        "<script> "
+        "let last_message = document.querySelectorAll('.stChatMessage'); "
+        "if (last_message.length > 0) { "
+        "  last_message[last_message.length - 1].scrollIntoView({behavior: 'smooth'}); "
+        "} "
+        "</script>",
+        height=0
     )
 
-# endregion
+def render_metadata_and_downloads():
+    if not (schema := st.session_state.get("last_schema")):
+        return
 
-
-# ==========================================================
-# region [16. Pipeline: First report + Follow-up chat]
-# ==========================================================
-def build_first_turn_payload(schema: Dict, video_meta: Dict, sample_text: str) -> str:
-    start_dt = datetime.fromisoformat(schema["start_iso"]).astimezone(KST)
-    end_dt = datetime.fromisoformat(schema["end_iso"]).astimezone(KST)
     kw_main = schema.get("keywords", [])
-    ents = schema.get("entities", [])
-    mode = video_meta.get("mode", "search")
-    if mode == "own_ip_cache":
-        target_str = f"자사 캐시(PGC) {video_meta.get('pgc_count', 0)}개 + 외부 UGC {video_meta.get('ugc_count', 0)}개 (OST 제외)"
-    else:
-        target_str = "검색 기반(전체 유튜브)"
-    return (
-        f"분석 주제(키워드): {kw_main[0] if kw_main else '(없음)'}\n"
-        f"보조 엔티티: {', '.join(ents) if ents else '(없음)'}\n"
-        f"분석 기간(KST): {start_dt.strftime('%Y-%m-%d %H:%M:%S')} ~ {end_dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"영상 소스: {target_str}\n"
-        f"댓글 데이터 샘플:\n{sample_text}\n"
-    )
+    start_iso, end_iso = schema.get('start_iso', ''), schema.get('end_iso', '')
+    try:
+        start_dt_str = datetime.fromisoformat(start_iso).astimezone(KST).strftime('%Y-%m-%d %H:%M')
+        end_dt_str   = datetime.fromisoformat(end_iso).astimezone(KST).strftime('%Y-%m-%d %H:%M')
+    except (ValueError, TypeError):
+        start_dt_str, end_dt_str = (start_iso.split('T')[0] if start_iso else ""), (end_iso.split('T')[0] if end_iso else "")
 
-def run_pipeline_first_turn(user_query: str, own_ip_enabled: bool, include_replies: bool) -> str:
-    prog = st.progress(0, text="준비 중…")
-    if not GEMINI_API_KEYS:
-        return "오류: GEMINI_API_KEYS가 설정되지 않았습니다."
-    if not YT_API_KEYS:
-        return "오류: YT_API_KEYS가 설정되지 않았습니다."
+    with st.container(border=True):
+        st.markdown(f"""
+            <div style="font-size:14px; color:#4b5563; line-height:1.8;">
+              <span style='font-weight:600;'>키워드:</span> {', '.join(kw_main) if kw_main else '(없음)'}<br>
+              <span style='font-weight:600;'>기간:</span> {start_dt_str} ~ {end_dt_str} (KST)
+            </div>
+            """, unsafe_allow_html=True)
 
-    prog.progress(0.06, text="질문 해석중…")
-    light = call_gemini_rotating(GEMINI_MODEL_CHAT, GEMINI_API_KEYS, None, LIGHT_PROMPT.replace("{USER_QUERY}", user_query), 512, 0.1)
+        csv_path, df_videos = st.session_state.get("last_csv"), st.session_state.get("last_df")
+        if csv_path and os.path.exists(csv_path) and df_videos is not None and not df_videos.empty:
+            with open(csv_path, "rb") as f: comment_csv_data = f.read()
+            buffer = io.BytesIO()
+            df_videos.to_csv(buffer, index=False, encoding="utf-8-sig")
+            video_csv_data = buffer.getvalue()
+            keywords_str = "_".join(kw_main).replace(" ", "_") if kw_main else "data"
+            now_str = now_kst().strftime('%Y%m%d')
+
+            col1, col2, col3, _ = st.columns([1.1, 1.2, 1.2, 6.5])
+            col1.markdown("<div style='font-size:14px; color:#4b5563; font-weight:600; padding-top:5px;'>다운로드:</div>", unsafe_allow_html=True)
+            with col2: st.download_button("전체댓글", comment_csv_data, f"comments_{keywords_str}_{now_str}.csv", "text/csv")
+            with col3: st.download_button("영상목록", video_csv_data, f"videos_{keywords_str}_{now_str}.csv", "text/csv")
+
+def render_chat():
+    for msg in st.session_state.chat:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+# endregion
+
+# region [Main Pipeline]
+
+def load_first_turn_system_prompt_fallback(default_prompt: str) -> str:
+    """레포에 '1차 질문 프롬프트.md'가 있으면 그걸 사용하고, 없으면 default_prompt 사용."""
+    try:
+        # Streamlit Cloud 기준: 작업 디렉토리가 repo root
+        if os.path.exists(FIRST_TURN_PROMPT_FILE):
+            with open(FIRST_TURN_PROMPT_FILE, "r", encoding="utf-8") as f:
+                txt = f.read().strip()
+                return txt if txt else default_prompt
+    except Exception:
+        pass
+    return default_prompt
+
+LIGHT_PROMPT = (
+    f"역할: 유튜브 댓글 반응 분석기의 자연어 해석가.\n"
+    f"목표: 한국어 입력에서 [기간(KST)]과 [키워드/엔티티/옵션]을 해석.\n"
+    f"규칙:\n"
+    f"- 기간은 Asia/Seoul 기준, 상대기간의 종료는 지금.\n"
+    f"- '키워드'는 검색에 사용할 가장 핵심적인 주제(프로그램, 브랜드 등) 1개로 한정한다.\n"
+    f"- '엔티티/보조'는 키워드 검색 결과 내에서 분석의 초점이 될 인물, 세부 주제 등을 포함한다.\n"
+    f"- '최근'이 없어도 '24시간/48시간/7일/3주/12개월'처럼 숫자+단위 표현은 '최근 N'으로 해석한다.\n"
+    f"- 옵션 탐지: include_replies, channel_filter(any|official|unofficial), lang(ko|en|auto).\n\n"
+    f"출력(6줄 고정):\n"
+    f"- 한 줄 요약: <문장>\n"
+    f"- 기간(KST): <YYYY-MM-DDTHH:MM:SS+09:00> ~ <YYYY-MM-DDTHH:MM:SS+09:00>\n"
+    f"- 키워드: [<핵심 키워드 1개>]\n"
+    f"- 엔티티/보조: [<인물>, <세부 주제 등>]\n"
+    f"- 옵션: {{ include_replies: true|false, channel_filter: \"any|official|unofficial\", lang: \"ko|en|auto\" }}\n"
+    f"- 원문: {{USER_QUERY}}\n\n"
+    f"현재 KST: {to_iso_kst(now_kst())}\n"
+    f"입력:\n{{USER_QUERY}}"
+)
+
+def parse_light_block_to_schema(light_text: str) -> dict:
+    raw = (light_text or "").strip()
+    m_time = re.search(r"기간\(KST\)\s*:\s*([^~]+)~\s*([^\n]+)", raw)
+    start_iso, end_iso = (m_time.group(1).strip(), m_time.group(2).strip()) if m_time else (None, None)
+    m_kw = re.search(r"키워드\s*:\s*\[(.*?)\]", raw, flags=re.DOTALL)
+    keywords = [p.strip() for p in re.split(r"\s*,\s*", m_kw.group(1)) if p.strip()] if m_kw else []
+    m_ent = re.search(r"엔티티/보조\s*:\s*\[(.*?)\]", raw, flags=re.DOTALL)
+    entities = [p.strip() for p in re.split(r"\s*,\s*", m_ent.group(1)) if p.strip()] if m_ent else []
+    m_opt = re.search(r"옵션\s*:\s*\{(.*?)\}", raw, flags=re.DOTALL)
+    options = {"include_replies": False, "channel_filter": "any", "lang": "auto"}
+    if m_opt:
+        blob = m_opt.group(1)
+        if ir := re.search(r"include_replies\s*:\s*(true|false)", blob, re.I): options["include_replies"] = (ir.group(1).lower() == "true")
+        if cf := re.search(r"channel_filter\s*:\s*\"(any|official|unofficial)\"", blob, re.I): options["channel_filter"] = cf.group(1)
+        if lg := re.search(r"lang\s*:\s*\"(ko|en|auto)\"", blob, re.I): options["lang"] = lg.group(1)
+    if not (start_iso and end_iso):
+        end_dt = now_kst()
+        start_dt = now_kst() - timedelta(hours=24)
+        start_iso, end_iso = to_iso_kst(start_dt), to_iso_kst(end_dt)
+    if not keywords:
+        keywords = [m[0]] if (m := re.findall(r"[가-힣A-Za-z0-9]{2,}", raw)) else ["유튜브"]
+    return {"start_iso": start_iso, "end_iso": end_iso, "keywords": keywords, "entities": entities, "options": options, "raw": raw}
+
+def run_pipeline_first_turn(user_query: str, extra_video_ids=None, only_these_videos: bool = False):
+    extra_video_ids = list(dict.fromkeys(extra_video_ids or []))
+    prog_bar = st.progress(0, text="준비 중…")
+
+    if not GEMINI_API_KEYS: return "오류: Gemini API Key가 설정되지 않았습니다."
+    prog_bar.progress(0.05, text="해석중…")
+    
+    # 여기서 call_gemini_rotating 호출 시 system_instruction="" 대신 None 처리는 함수 내부에서 함
+    light = call_gemini_rotating(GEMINI_MODEL, GEMINI_API_KEYS, "", LIGHT_PROMPT.replace("{USER_QUERY}", user_query))
     schema = parse_light_block_to_schema(light)
     st.session_state["last_schema"] = schema
 
-    # Cache-only requirement
-    cache_videos = st.session_state.get("cache_video_rows", []) if own_ip_enabled else []
-    prog.progress(0.12, text="영상 ID 수집중…")
-    extra_ids = extract_video_ids_from_text(user_query)
+    prog_bar.progress(0.10, text="영상 수집중…")
+    if not YT_API_KEYS: return "오류: YouTube API Key가 설정되지 않았습니다."
+    
+    rt = RotatingYouTube(YT_API_KEYS)
+    start_dt, end_dt = datetime.fromisoformat(schema["start_iso"]), datetime.fromisoformat(schema["end_iso"])
+    kw_main, kw_ent = schema.get("keywords", []), schema.get("entities", [])
 
-    try:
-        video_ids, video_meta = build_video_pool(schema, own_ip_enabled, cache_videos, extra_video_ids=extra_ids)
-    except Exception as e:
-        return f"오류: {e}"
-    if not video_ids:
-        return "오류: 영상 ID를 찾지 못했습니다."
 
-    prog.progress(0.30, text="영상 메타 수집중…")
-    rt = RotatingYouTube(YT_API_KEYS, idx_seed="yt_stats")
-    stats = yt_video_statistics(rt, video_ids)
-    df_videos = pd.DataFrame(stats)
-    st.session_state["last_df"] = df_videos
+    own_mode = bool(st.session_state.get("own_ip_mode", False))
+    pgc_ids = []
+    if own_mode:
+        ok, msg, _ = sync_pgc_cache_from_github(force=False)
+        if not ok:
+            return f"자사모드 캐시 동기화 실패: {msg}"
+        # ✅ ytan 방식: 캐시에서는 '키워드'만으로 PGC 후보를 찾는다.
+        for base_kw in (kw_main or []):
+            pgc_ids.extend(load_pgc_video_ids_by_keyword(base_kw))
+        pgc_ids = list(dict.fromkeys(pgc_ids))
 
-    prog.progress(0.40, text="댓글 수집 시작… (상한 없음)")
-    csv_path, _ = parallel_collect_comments_streaming(df_videos.to_dict("records"), include_replies=include_replies, progress_bar=prog)
+    if only_these_videos and extra_video_ids:
+        all_ids = extra_video_ids
+    else:
+        all_ids = []
+        for base_kw in (kw_main or ["유튜브"]):
+            all_ids.extend(yt_search_videos(rt, base_kw, 60, "relevance", kst_to_rfc3339_utc(start_dt), kst_to_rfc3339_utc(end_dt)))
+            for e in kw_ent:
+                all_ids.extend(yt_search_videos(rt, f"{base_kw} {e}", 30, "relevance", kst_to_rfc3339_utc(start_dt), kst_to_rfc3339_utc(end_dt)))
+        if extra_video_ids:
+            all_ids.extend(extra_video_ids)
+        if own_mode and pgc_ids:
+            all_ids.extend(pgc_ids)
+
+    all_ids = list(dict.fromkeys(all_ids))
+    prog_bar.progress(0.40, text="댓글 수집 준비중…")
+
+    df_stats = pd.DataFrame(yt_video_statistics(rt, all_ids))
+    # 자사모드에서는 검색 결과 중 제목에 OST가 포함된 영상은 우선 제외 (ytan 스타일)
+    if bool(st.session_state.get("own_ip_mode", False)) and (not df_stats.empty) and ("title" in df_stats.columns):
+        df_stats = df_stats[~df_stats["title"].astype(str).str.contains(r"OST", case=False, na=False)]
+    st.session_state["last_df"] = df_stats
+
+    csv_path, total_cnt = parallel_collect_comments_streaming(
+        df_stats.to_dict('records'), YT_API_KEYS, bool(schema.get("options", {}).get("include_replies")),
+        MAX_TOTAL_COMMENTS, MAX_COMMENTS_PER_VID, prog_bar
+    )
     st.session_state["last_csv"] = csv_path
 
-    prog.progress(0.88, text="샘플링 구성중…")
+    if total_cnt == 0:
+        prog_bar.empty()
+        return "지정 조건에서 댓글을 찾을 수 없습니다. 다른 조건으로 시도해 보세요."
+
+    prog_bar.progress(0.90, text="AI 분석중…")
     sample_text, _, _ = serialize_comments_for_llm_from_file(csv_path)
     st.session_state["sample_text"] = sample_text
 
-    prog.progress(0.92, text="AI 리포트 생성중… (HTML)")
-    sys_prompt = load_prompt_file(PROMPT_FILE_1ST).strip()
-    if not sys_prompt:
-        return "오류: 1차 질문 프롬프트.md 파일을 찾지 못했습니다."
-    sys_prompt += "\n\n추가 규칙: 반드시 <!--REPORT_START--> 와 <!--REPORT_END--> 마커로 리포트 전체를 감싸라."
-
-    raw = call_gemini_rotating(GEMINI_MODEL_REPORT, GEMINI_API_KEYS, sys_prompt, build_first_turn_payload(schema, video_meta, sample_text), GEMINI_MAX_TOKENS_REPORT, 0.25)
-    html_report = extract_report_html(raw) or f"<div>{raw}</div>"
-
-    st.session_state["report_html"] = html_report
-    st.session_state["report_done"] = True
-    st.session_state["video_source_mode"] = video_meta.get("mode", "search")
-    return html_report
-
-def run_followup_turn(user_message: str) -> str:
-    schema = st.session_state.get("last_schema") or {}
-    sample_text = st.session_state.get("sample_text", "") or ""
-    meta = (
-        f"[분석 주제] {(schema.get('keywords') or [''])[0]}\n"
-        f"[기간(KST ISO)] {schema.get('start_iso','')} ~ {schema.get('end_iso','')}\n"
-        f"[영상 소스 모드] {st.session_state.get('video_source_mode','search')}\n"
+    sys = (
+        "역할: 너는 유튜브 댓글을 기반으로 여론을 읽어내는 '리서치 애널리스트'다.\n"
+        "감정 과장은 빼고, 데이터 기반 보고서처럼 **냉정하고 구조적으로** 써라.\n\n"
+        "=== 입력 설명 ===\n"
+        "- [사용자 원본 질문]: 사용자가 원하는 분석 방향.\n"
+        "- [키워드], [엔티티]: 어떤 IP/주제에 대한 반응인지에 대한 힌트.\n"
+        "- [기간(KST)]: 분석 대상 댓글이 수집된 시간 구간.\n"
+        "- [댓글 샘플]:\n"
+        "    • 한 줄당 하나의 댓글.\n"
+        "    • 앞부분에는 [T|R], 좋아요 수, 작성자명이 붙어 있다.\n"
+        "      예) [T|♥12] 닉네임: 내용...\n\n"
+        "=== 안전/검열 수칙 (매우 중요) ===\n"
+        "- 댓글 원문에는 욕설·비하·혐오 표현이 있을 수 있다.\n"
+        "- 그런 표현을 인용할 때는 반드시 다음 중 하나로 처리한다.\n"
+        "  1) 욕설 부분을 '**'로 가리기\n"
+        "     예) '씨발 연기 왜 이렇게 잘해' → '** 연기 왜 이렇게 잘해'\n"
+        "  2) 의미는 유지하되 순화된 표현으로 바꾸기\n"
+        "     예) '개쩐다' → '정말 대단하다'\n"
+        "- 절대 시스템이 금지하는 원문 욕설/혐오 단어를 그대로 쓰지 마라.\n\n"
+        "=== 출력 형식 가이드 ===\n"
+        "아래 구조를 항상 지켜라. 마크다운 형식을 사용해 가독성을 높여라.\n\n"
+        "1. **3줄 요약**  \n"
+        "   - 전체 여론의 방향을 한눈에 알 수 있도록 3문장으로 요약한다.\n"
+        "   - '좋음/나쁨'만 말하지 말고, **무엇 때문에** 그런지까지 넣어라.\n\n"
+        "2. **감성 분포**  \n"
+        "   - 댓글 내용을 기준으로 긍정/부정/중립 비율을 추정해서 숫자로 써라.\n"
+        "   - 예시 형식: `긍정 55% | 부정 30% | 중립 15% (대략적인 추정)`\n\n"
+        "3. **주요 토픽 분석 (핵심 파트)**  \n"
+        "   - 댓글에서 반복적으로 등장하는 주제를 3~4개 뽑아서, 각각 `### 토픽명` 형식의 소제목으로 나눠라.\n"
+        "   - 각 토픽마다 아래 내용을 반드시 포함한다.\n"
+        "     1) 요약: 사람들이 이 토픽에 대해 어떤 톤(호/불호/논쟁/우려)으로 말하는지.\n"
+        "     2) 근거 댓글 인용: 최소 2개. 실제 댓글 문장을 따오되, 욕설은 위 규칙대로 마스킹/순화.\n"
+        "        - 인용 형식 예: `> \"내용\"`\n"
+        "        - 좋아요 수가 많거나, 표현이 인상적인 댓글 위주로 골라라.\n\n"
+        "4. **특이점 / 인사이트 한 줄**  \n"
+        "   - 비중은 작지만 눈에 띄는 의견, 예상 밖 포인트, 향후 리스크/기회 요인을 1~2줄로 정리한다.\n\n"
+        "=== 금지 사항 ===\n"
+        "- '전반적으로 반응이 좋습니다' 같은 애매한 문장만 쓰지 마라. 항상 **왜 그렇게 보이는지** 근거를 붙여라.\n"
+        "- 실제 댓글에서 볼 수 없는 내용은 새로 지어내지 말 것.\n"
+        "- 동일한 내용을 여러 표현으로 반복하지 말고, 가능한 많은 실제 패턴을 커버해라.\n"
     )
-    history = st.session_state.get("chat", [])
-    recent = []
-    for m in history[-6:]:
-        if m.get("role") == "assistant" and (m.get("is_report") or False):
-            continue
-        txt = m.get("content", "")
-        if len(txt) > 2000:
-            txt = txt[:2000] + "…"
-        recent.append(f"{m.get('role','user')}: {txt}")
-    prompt = f"{meta}\n[최근 대화]\n" + "\n".join(recent) + f"\n\n[댓글 샘플]\n{sample_text}\n\n[사용자 질문]\n{user_message}\n"
-    ans = call_gemini_rotating(GEMINI_MODEL_CHAT, GEMINI_API_KEYS, system_prompt_followup(), prompt, GEMINI_MAX_TOKENS_CHAT, 0.35)
-    return (ans or "").strip()
 
+
+    # (추가) 1차 분석 프롬프트를 파일로 분리해서 관리할 수 있게 함
+    sys = load_first_turn_system_prompt_fallback(sys)
+
+
+    payload = (
+        f"[사용자 원본 질문]: {user_query}\n\n"
+        f"[키워드]: {', '.join(kw_main)}\n"
+        f"[엔티티]: {', '.join(kw_ent)}\n"
+        f"[기간(KST)]: {schema['start_iso']} ~ {schema['end_iso']}\n\n"
+        f"[댓글 샘플]:\n{sample_text}\n"
+    )
+    answer_md_raw = call_gemini_rotating(GEMINI_MODEL, GEMINI_API_KEYS, sys, payload)
+
+    prog_bar.progress(1.0, text="완료")
+    time.sleep(0.5)
+    prog_bar.empty()
+    gc.collect()
+
+    return tidy_answer(answer_md_raw)
+
+def run_followup_turn(user_query: str):
+    if not (schema := st.session_state.get("last_schema")):
+        return "오류: 이전 분석 기록이 없습니다. 새 채팅을 시작해주세요."
+
+    sample_text = st.session_state.get("sample_text", "")
+    context = "\n".join(f"[이전 {'Q' if m['role'] == 'user' else 'A'}]: {m['content']}" for m in st.session_state["chat"][-10:])
+
+    sys = (
+        "역할: 너는 이미 한 번 요약된 유튜브 댓글 데이터를 바탕으로\n"
+        "사용자의 추가 질문에 대해 '수사 보고서'처럼 구체적인 근거를 제시하는 수석 조사관이다.\n\n"
+        "=== 상황 ===\n"
+        "- 사용자는 첫 질문에서 전체 요약을 이미 받아봤다.\n"
+        "- 지금은 특정 디테일만 알고 싶어 한다. (예: 배우 연기, 엔딩 반응, 논란 등)\n"
+        "- 그러므로 **이번 질문과 직접 관련된 부분만** 좁게 답하면 된다.\n\n"
+        "=== 데이터 ===\n"
+        "- [댓글 샘플]에는 전체 댓글이 요약 없이 들어있다.\n"
+        "- [이전 Q/A]에는 직전까지 주고받은 요약/설명이 들어있다.\n"
+        "- 단, 이번 답변에서는 예전 요약을 다시 반복하지 말고,\n"
+        "  오직 '[현재 질문]'에 맞는 내용만 따로 뽑아서 말한다.\n\n"
+        "=== 답변 전략 ===\n"
+        "1. 검색 모드\n"
+        "   - 먼저 [현재 질문]을 읽고, 그 질문이 겨냥하는 대상/속성을 명확히 정의한다.\n"
+        "     예) '여주 연기 혹평 많아?' → 대상: 여주인공, 속성: 연기력 평가(부정 여부)\n"
+        "   - [댓글 샘플]에서 그 대상과 속성에 **직접적으로 연결된 댓글만** 필터링한다.\n"
+        "   - 관련 없는 이야기(다른 캐릭터, 다른 이슈, 잡담 등)는 90% 이상 버려도 된다.\n\n"
+        "2. 근거 기반 서술\n"
+        "   - 결론을 먼저 한두 문장으로 말하고, 그다음에 근거 댓글을 인용한다.\n"
+        "   - 인용 규칙:\n"
+        "     - 최소 2개 이상, 가능하면 서로 다른 관점을 보여주는 댓글을 고른다.\n"
+        "     - 마크다운 인용문 형식 사용: `> \"댓글 내용\"`\n"
+        "     - 욕설/비하/혐오 표현이 있으면 '**'로 가리거나 순화해서 쓴다.\n\n"
+        "3. 데이터 부재 시 처리\n"
+        "   - 질문과 직접 연결되는 댓글 패턴을 찾지 못하면, 절대 내용을 지어내지 말고\n"
+        "     '해당 질문과 관련된 뚜렷한 언급은 데이터에서 거의 보이지 않는다'고 솔직하게 말한다.\n"
+        "   - 대신, 그와 가장 근접한 패턴이 있다면 그 정도까지만 조심스럽게 언급한다.\n\n"
+        "=== 안전/검열 수칙 ===\n"
+        "- 욕설, 비속어, 혐오 표현이 포함된 댓글은 **반드시 일부를 '**'로 마스킹하거나 순화 표현으로 바꿔서** 인용한다.\n"
+        "- 모델/시스템이 차단할 수 있는 직접적인 단어는 쓰지 말고, 의미만 전달하라.\n\n"
+        "=== 금지 사항 ===\n"
+        "- '전반적으로 다양한 의견이 있습니다' 같은 뭉뚱그린 표현만 던지고 끝내지 마라.\n"
+        "- 직전 답변이나 첫 번째 요약을 거의 그대로 재탕하지 마라.\n"
+        "- 질문과 상관없는 TMI(다른 배우 얘기, 다른 장르 얘기 등)는 넣지 마라.\n"
+    )
+
+
+    payload = (
+        f"{context}\n\n"
+        f"[현재 질문]: {user_query}\n"
+        f"[기간(KST)]: {schema.get('start_iso', '?')} ~ {schema.get('end_iso', '?')}\n\n"
+        f"[댓글 샘플]:\n{sample_text}\n"
+    )
+
+    with st.spinner("💬 AI가 답변을 구성 중입니다..."):
+        response_raw = call_gemini_rotating(GEMINI_MODEL, GEMINI_API_KEYS, sys, payload)
+        response = tidy_answer(response_raw)
+
+    return response
 # endregion
 
-
-# ==========================================================
-# region [17. Downloads + Session Save]
-# ==========================================================
-def _safe_read_bytes(path: str) -> bytes:
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except Exception:
-        return b""
-
-def render_downloads():
-    csv_path = st.session_state.get("last_csv", "")
-    df_videos = st.session_state.get("last_df")
-    if csv_path and os.path.exists(csv_path):
-        st.download_button("⬇️ 댓글 CSV 다운로드", data=_safe_read_bytes(csv_path), file_name=os.path.basename(csv_path), mime="text/csv", use_container_width=True)
-    if isinstance(df_videos, pd.DataFrame) and not df_videos.empty:
-        buf = io.BytesIO()
-        df_videos.to_csv(buf, index=False, encoding="utf-8-sig")
-        st.download_button("⬇️ 영상 메타 CSV 다운로드", data=buf.getvalue(), file_name=f"videos_{now_kst().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv", use_container_width=True)
-
-def github_upload_bytes(repo: str, branch: str, path_in_repo: str, content_bytes: bytes, token: str, message: str):
-    url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}"
-    headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
-    payload = {"message": message, "content": base64.b64encode(content_bytes).decode("utf-8"), "branch": branch}
-    r0 = requests.get(url, headers=headers)
-    if r0.status_code == 200:
-        sha = (r0.json() or {}).get("sha")
-        if sha:
-            payload["sha"] = sha
-    r = requests.put(url, headers=headers, data=json.dumps(payload))
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub 업로드 실패: {r.status_code} {r.text}")
-
-def save_session_to_github():
-    if not (SESSION_GITHUB_TOKEN and SESSION_GITHUB_REPO):
-        return False, "SESSION_GITHUB_TOKEN / SESSION_GITHUB_REPO 설정이 없습니다."
-    if not st.session_state.get("last_csv") or not os.path.exists(st.session_state["last_csv"]):
-        return False, "저장할 댓글 CSV가 없습니다."
-    df = st.session_state.get("last_df")
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return False, "저장할 영상 메타가 없습니다."
-
-    sess_name = now_kst().strftime("%Y%m%d_%H%M%S") + "_" + hashlib.md5(str(time.time()).encode()).hexdigest()[:6]
-    base = f"sessions/{sess_name}"
-
-    qa = {"chat": st.session_state.get("chat", []),
-          "last_schema": st.session_state.get("last_schema"),
-          "report_html": st.session_state.get("report_html", ""),
-          "video_source_mode": st.session_state.get("video_source_mode", "search")}
-    github_upload_bytes(SESSION_GITHUB_REPO, SESSION_GITHUB_BRANCH, f"{base}/qa.json", json.dumps(qa, ensure_ascii=False, indent=2).encode("utf-8"), SESSION_GITHUB_TOKEN, f"save session {sess_name} (qa)")
-    github_upload_bytes(SESSION_GITHUB_REPO, SESSION_GITHUB_BRANCH, f"{base}/comments.csv", _safe_read_bytes(st.session_state["last_csv"]), SESSION_GITHUB_TOKEN, f"save session {sess_name} (comments)")
-    buf = io.BytesIO()
-    df.to_csv(buf, index=False, encoding="utf-8-sig")
-    github_upload_bytes(SESSION_GITHUB_REPO, SESSION_GITHUB_BRANCH, f"{base}/videos.csv", buf.getvalue(), SESSION_GITHUB_TOKEN, f"save session {sess_name} (videos)")
-    return True, f"세션 저장 완료: {sess_name}"
-
-# endregion
-
-
-# ==========================================================
-# region [18. Main UI]
-# ==========================================================
-st.set_page_config(page_title="ytcc (CACHE-ONLY Own-IP)", page_icon="💬", layout="wide")
-st.title("💬 ytcc — CACHE-ONLY Own-IP")
-st.caption("자사 IP 토글 ON은 ytan 캐시(cache_token_*.json) 로드가 필수. 캐시 없으면 실행 불가.")
-
+# region [Main Execution]
 with st.sidebar:
-    st.subheader("⚙️ 수집 설정")
-    st.session_state["include_replies"] = st.checkbox("대댓글(Reply) 포함", value=bool(st.session_state.get("include_replies", True)))
+    st.markdown('<h2 style="font-weight:600; font-size:1.6rem; margin-bottom:1.5rem; background:-webkit-linear-gradient(45deg, #4285F4, #9B72CB, #D96570, #F2A60C); -webkit-background-clip:text; -webkit-text-fill-color:transparent;">💬 유튜브 댓글분석: AI 챗봇</h2>', unsafe_allow_html=True)
+    st.caption("문의: 미디어)디지털마케팅 데이터파트")
 
-    st.divider()
-    st.subheader("🏷️ 자사 IP 모드 (CACHE ONLY)")
-    st.session_state["own_ip_enabled"] = st.toggle("자사 IP (캐시 PGC + UGC 혼합)", value=bool(st.session_state.get("own_ip_enabled", False)))
-    st.caption("자사 IP 모드 ON이면 cache_token_*.json이 반드시 필요합니다.")
+    st.markdown("""<style>[data-testid="stSidebarUserContent"] {display: flex; flex-direction: column; height: calc(100vh - 4rem);} .sidebar-top-section { flex-grow: 1; overflow-y: auto; } .sidebar-bottom-section { flex-shrink: 0; }</style>""", unsafe_allow_html=True)
 
-    cache_dir = st.text_input("캐시 디렉토리(서버 로컬)", value=st.session_state.get("cache_dir", CACHE_DIR_DEFAULT))
-    st.session_state["cache_dir"] = cache_dir
+    st.markdown('<div class="sidebar-top-section">', unsafe_allow_html=True)
+    st.markdown('<div class="new-chat-btn">', unsafe_allow_html=True)
+    if st.button("✨ 새 채팅", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🔎 캐시 스캔", use_container_width=True):
-            files = scan_cache_files(cache_dir)
-            st.session_state["cache_files"] = files
-            vids = load_cache_videos(files)
-            st.session_state["cache_video_rows"] = vids
-            st.session_state["cache_loaded"] = True
-            st.success(f"캐시 파일 {len(files)}개 / 영상 {len(vids)}개 로드")
-    with col2:
-        if st.button("☁️ GitHub 캐시 동기화", use_container_width=True, disabled=not (CACHE_GITHUB_TOKEN and CACHE_GITHUB_REPO)):
-            try:
-                ok, msg, saved = sync_cache_from_github(cache_dir)
-            except Exception as e:
-                ok, msg, saved = False, str(e), []
-            if ok:
-                st.success(msg)
-                st.session_state["cache_files"] = saved
-                vids = load_cache_videos(saved)
-                st.session_state["cache_video_rows"] = vids
-                st.session_state["cache_loaded"] = True
-                st.info(f"캐시 영상 {len(vids)}개")
+    if st.session_state.chat and st.session_state.last_csv:
+        if st.button("💾 현재 대화 저장", use_container_width=True):
+            with st.spinner("세션 저장 중..."):
+                success, result = save_current_session_to_github()
+            if success:
+                st.success(f"'{result}' 저장 완료!")
+                time.sleep(2)
+                st.rerun()
+            else: st.error(result)
+
+    st.markdown("---")
+    st.markdown("#### 대화 기록")
+
+    if not all([GITHUB_TOKEN, GITHUB_REPO]):
+        st.caption("GitHub 설정이 Secrets에 없습니다.")
+    else:
+        try:
+            sessions = sorted(github_list_dir(GITHUB_REPO, GITHUB_BRANCH, "sessions", GITHUB_TOKEN), reverse=True)
+            if not sessions: st.caption("저장된 기록이 없습니다.")
             else:
-                st.error(msg)
+                editing_session = st.session_state.get("editing_session", None)
+                st.markdown('<div class="session-list">', unsafe_allow_html=True)
+                for sess in sessions:
+                    if sess == editing_session:
+                        new_name = st.text_input("새 이름:", value=sess, key=f"new_name_{sess}")
+                        c1, c2 = st.columns(2)
+                        if c1.button("✅", key=f"save_{sess}"):
+                            st.session_state.session_to_rename = (sess, new_name)
+                            st.session_state.pop('editing_session', None)
+                            st.rerun()
+                        if c2.button("❌", key=f"cancel_{sess}"):
+                            st.session_state.pop('editing_session', None)
+                            st.rerun()
+                    else:
+                        c1, c2, c3 = st.columns([0.7, 0.15, 0.15])
+                        if c1.button(sess, key=f"sess_{sess}", use_container_width=True):
+                            st.session_state.session_to_load = sess
+                            st.rerun()
+                        if c2.button("✏️", key=f"edit_{sess}"):
+                            st.session_state.editing_session = sess
+                            st.rerun()
+                        if c3.button("🗑️", key=f"del_{sess}"):
+                            st.session_state.session_to_delete = sess
+                            st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+        except Exception: st.error("기록 로딩 실패")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("cache_token_*.json 업로드(복수 가능)", type=["json"], accept_multiple_files=True)
-    if uploaded:
-        os.makedirs(cache_dir, exist_ok=True)
-        saved = []
-        for uf in uploaded:
-            name = uf.name
-            if not (name.startswith("cache_token_") and name.endswith(".json")):
-                name = f"cache_token_uploaded_{hashlib.md5(name.encode()).hexdigest()[:8]}.json"
-            local = os.path.join(cache_dir, name)
-            with open(local, "wb") as f:
-                f.write(uf.getbuffer())
-            saved.append(local)
-        st.session_state["cache_files"] = sorted(list(dict.fromkeys(st.session_state.get("cache_files", []) + saved)))
-        vids = load_cache_videos(st.session_state["cache_files"])
-        st.session_state["cache_video_rows"] = vids
-        st.session_state["cache_loaded"] = True
-        st.success(f"업로드 반영: 캐시 파일 {len(st.session_state['cache_files'])}개 / 영상 {len(vids)}개")
+    st.markdown('<div class="sidebar-bottom-section">', unsafe_allow_html=True)
+    st.markdown("""<hr><h3>📞 문의</h3><p>미디어)디지털마케팅 데이터파트</p>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    if st.session_state.get("cache_loaded"):
-        st.caption(f"현재 로드된 캐시 영상 수: {len(st.session_state.get('cache_video_rows', [])):,}")
-
-    st.divider()
-    st.subheader("💾 Export / Save")
-    render_downloads()
-    if st.button("☁️ GitHub에 세션 저장", use_container_width=True, disabled=not (SESSION_GITHUB_TOKEN and SESSION_GITHUB_REPO)):
-        ok, msg = save_session_to_github()
-        (st.success if ok else st.error)(msg)
-
-st.divider()
-
-if not st.session_state.get("report_done", False):
-    st.markdown("### 1) 분석 질문을 입력하세요")
-    user_query = st.text_area("요청(자연어)", height=120)
-    run = st.button("🚀 분석 시작", type="primary", use_container_width=True)
-
-    if run and user_query.strip():
-        if st.session_state.get("own_ip_enabled", False) and not st.session_state.get("cache_video_rows"):
-            st.error("자사 IP 모드 ON: cache_token_*.json 캐시를 먼저 로드/업로드/동기화하세요.")
-            st.stop()
-
-        html_report = run_pipeline_first_turn(user_query.strip(), bool(st.session_state.get("own_ip_enabled", False)), bool(st.session_state.get("include_replies", True)))
-        st.session_state["chat"] = [{"role": "user", "content": user_query.strip()}, {"role": "assistant", "content": html_report, "is_report": True}]
-        st.rerun()
+if not st.session_state.chat:
+    st.markdown(
+        """
+<div style="display:flex; flex-direction:column; align-items:center; justify-content:center;
+            text-align:center; height:70vh;">
+  <h1 style="font-size:3.5rem; font-weight:600;
+             background:-webkit-linear-gradient(45deg, #4285F4, #9B72CB, #D96570, #F2A60C);
+             -webkit-background-clip:text; -webkit-text-fill-color:transparent;">
+    유튜브 댓글분석: AI 챗봇
+  </h1>
+  <p style="font-size:1.2rem; color:#4b5563;">관련영상 유튜브 댓글반응을 AI가 요약해줍니다</p>
+  <div style="margin-top:3rem; padding:1rem 1.5rem; border:1px solid #e5e7eb; border-radius:12px;
+              background-color:#fafafa; max-width:600px; text-align:left;">
+    <h4 style="margin-bottom:1rem; font-weight:600;">⚠️ 사용 주의사항</h4>
+    <ol style="padding-left:20px;">
+      <li><strong>첫 질문 시</strong> 댓글 수집 및 AI 분석에 시간이 소요될 수 있습니다.</li>
+      <li>한 세션에서는 <strong>하나의 주제</strong>만 진행해야 분석 정확도가 유지됩니다.</li>
+      <li>첫 질문에는 <strong>기간을 명시</strong>해주세요 (예: 최근 48시간 / 5월 1일부터).</li>
+    </ol>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 else:
-    st.markdown("### ✅ 첫 리포트 (HTML)")
-    report_html = st.session_state.get("report_html", "")
-    if report_html:
-        st_html(report_html, height=820, scrolling=True)
+    render_metadata_and_downloads()
+    render_chat()
+    scroll_to_bottom()
 
-    st.divider()
-    st.markdown("### 2) 후속 질문 (대화형)")
-    for msg in st.session_state.get("chat", []):
-        if msg.get("role") == "assistant" and msg.get("is_report"):
-            continue
-        with st.chat_message(msg.get("role", "user")):
-            st.write(msg.get("content", ""))
 
-    user_msg = st.chat_input("후속 질문을 입력하세요")
-    if user_msg:
-        st.session_state["chat"].append({"role": "user", "content": user_msg})
-        with st.chat_message("assistant"):
-            with st.spinner("답변 생성중…"):
-                ans = run_followup_turn(user_msg)
-                st.write(ans)
-        st.session_state["chat"].append({"role": "assistant", "content": ans})
+# ─────────────────────────────────────────────────────────────────────────────
+# (추가) 자사 모드 토글 (첫 질문 입력창 위)
+#  - 토글 ON 순간: 캐시 레포에서 cache_token_*.json 자동 동기화
+#  - 토글 OFF: 기존 ytcc 검색 로직 그대로
+# ─────────────────────────────────────────────────────────────────────────────
+is_first_turn = not bool(st.session_state.get("last_csv"))
+with st.container():
+    st.toggle(
+        "🧩 자사 IP 모드 (PGC 캐시 + UGC 검색)",
+        key="own_ip_mode",
+        disabled=not is_first_turn,
+        help="ON: 자사(PGC) 캐시로 공식 영상 후보를 확보하고, 동시에 YouTube 검색으로 외부(UGC)까지 함께 수집합니다. (첫 질문에서만 설정 가능)"
+    )
+    if not is_first_turn:
+        st.caption("※ 진행 중인 세션에서는 자사 모드를 변경할 수 없습니다. '✨ 새 채팅'에서 변경하세요.")
 
-    st.divider()
-    if st.button("🔄 세션 초기화(처음으로)", use_container_width=True):
-        for k in list(st.session_state.keys()):
-            del st.session_state[k]
-        ensure_state()
-        st.rerun()
+# 토글 ON 시점에 캐시 자동 동기화 (버튼 없음)
+cur_toggle = bool(st.session_state.get("own_ip_mode", False))
+prev_toggle = st.session_state.get("own_ip_toggle_prev", None)
+if is_first_turn and cur_toggle and (prev_toggle is None or prev_toggle is False):
+    with st.spinner("🧩 자사(PGC) 캐시 동기화 중..."):
+        ok, msg, saved = sync_pgc_cache_from_github(force=True)
+    if ok:
+        st.success(f"자사 캐시 동기화 완료 ({len(saved)}개 파일).")
+    else:
+        st.error(msg)
+st.session_state["own_ip_toggle_prev"] = cur_toggle
 
+if prompt := st.chat_input("예) 최근 24시간 태풍상사 반응 요약해줘 / 또는 영상 URL 붙여도 OK"):
+    st.session_state.chat.append({"role": "user", "content": prompt})
+    st.rerun()
+
+if st.session_state.chat and st.session_state.chat[-1]["role"] == "user":
+    user_query = st.session_state.chat[-1]["content"]
+    url_ids = extract_video_ids_from_text(user_query)
+    natural_text = strip_urls(user_query)
+    has_urls = len(url_ids) > 0
+    has_natural = len(natural_text) > 0
+
+    if not st.session_state.get("last_csv"):
+        if has_urls and not has_natural:
+            response = run_pipeline_first_turn(user_query, extra_video_ids=url_ids, only_these_videos=True)
+        elif has_urls and has_natural:
+            response = run_pipeline_first_turn(user_query, extra_video_ids=url_ids, only_these_videos=False)
+        else:
+            response = run_pipeline_first_turn(user_query)
+    else:
+        response = run_followup_turn(user_query)
+
+    st.session_state.chat.append({"role": "assistant", "content": response})
+    st.rerun()
 # endregion

@@ -141,7 +141,7 @@ st.markdown(
 _YT_FALLBACK, _GEM_FALLBACK = [], []
 YT_API_KEYS       = list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
 GEMINI_API_KEYS   = list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
-GEMINI_MODEL      = "gemini-3.0-flash-preview"  
+GEMINI_MODEL      = "gemini-3-flash-preview"  
 GEMINI_TIMEOUT    = 120
 GEMINI_MAX_TOKENS = 8192
 MAX_TOTAL_COMMENTS   = 120_000

@@ -28,6 +28,7 @@ import base64
 import random
 import hashlib
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from typing import Callable, Dict, List, Optional, Tuple
 
 import streamlit as st
@@ -46,7 +47,7 @@ CACHE_DIR_DEFAULT = os.path.join(BASE_DIR, "yt_cache")
 os.makedirs(SESS_DIR, exist_ok=True)
 os.makedirs(CACHE_DIR_DEFAULT, exist_ok=True)
 
-PROMPT_FILE_1ST = "1차 질문 프롬프트.md"
+PROMPT_FILE_1ST = "1차 질문 프롬프트.md"  # repo에 함께 두는 것을 권장
 OST_EXCLUDE_RE = re.compile(r"\b(ost|o\.s\.t)\b", re.I)
 
 # endregion
@@ -72,7 +73,7 @@ YT_API_KEYS     = _as_list(st.secrets.get("YT_API_KEYS", [])) or _YT_FALLBACK
 GEMINI_API_KEYS = _as_list(st.secrets.get("GEMINI_API_KEYS", [])) or _GEM_FALLBACK
 
 # Gemini models (optional)
-GEMINI_MODEL_REPORT = st.secrets.get("GEMINI_MODEL_REPORT", "gemini-3-flash-preview")
+GEMINI_MODEL_REPORT = st.secrets.get("GEMINI_MODEL_REPORT", "gemini-3.0-flash-preview")
 GEMINI_MODEL_CHAT   = st.secrets.get("GEMINI_MODEL_CHAT", "gemini-2.5-flash")
 
 GEMINI_TIMEOUT = 180
@@ -455,20 +456,51 @@ def filter_pgc_ids_from_cache(videos: List[Dict], keyword: str, start_dt: dateti
 # region [10. GitHub Cache Sync (optional)]
 # ==========================================================
 def _gh_headers(token: str) -> Dict[str, str]:
-    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    # Fine-grained PAT은 Bearer 방식을 요구하는 경우가 많아 Bearer를 기본으로 사용
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "ytcc-cache-sync",
+    }
 
 def github_list_dir(repo: str, branch: str, path_in_repo: str, token: str) -> List[Dict]:
-    url = f"https://api.github.com/repos/{repo}/contents/{path_in_repo}?ref={branch}"
+    # GitHub Contents API: path는 URL 인코딩 필요(공백/한글 등 대비)
+    safe_path = quote((path_in_repo or "").strip("/"))
+    url = f"https://api.github.com/repos/{repo}/contents/{safe_path}?ref={branch}"
     r = requests.get(url, headers=_gh_headers(token))
     if r.status_code != 200:
-        raise RuntimeError(f"GitHub 목록 실패: {r.status_code} {r.text}")
+        # Streamlit Cloud에서 r.text를 그대로 던지면 redaction이 걸려 디버깅이 어려움.
+        # message만 안전하게 추출해서 에러로 올림.
+        msg = ""
+        try:
+            j = r.json()
+            if isinstance(j, dict):
+                msg = j.get("message", "") or ""
+        except Exception:
+            msg = ""
+        hint = ""
+        if r.status_code in (401,):
+            hint = " (401: 토큰이 없거나 권한/형식이 잘못됨 — Fine-grained PAT이면 repo 권한과 Bearer 형식 확인)"
+        elif r.status_code in (403,):
+            hint = " (403: 권한 부족 또는 rate limit — repo 접근 권한/limit 확인)"
+        elif r.status_code in (404,):
+            hint = " (404: repo/경로/브랜치가 틀림 — CACHE_GITHUB_REPO/PATH/BRANCH 확인)"
+        raise RuntimeError(f"GitHub 목록 실패: {r.status_code} {msg}{hint}")
     data = r.json()
     return data if isinstance(data, list) else []
 
 def github_download_file(download_url: str, token: str) -> bytes:
     r = requests.get(download_url, headers=_gh_headers(token))
     if r.status_code != 200:
-        raise RuntimeError(f"GitHub 다운로드 실패: {r.status_code} {r.text}")
+        msg = ""
+        try:
+            j = r.json()
+            if isinstance(j, dict):
+                msg = j.get("message", "") or ""
+        except Exception:
+            msg = ""
+        raise RuntimeError(f"GitHub 다운로드 실패: {r.status_code} {msg}")
     return r.content
 
 def sync_cache_from_github(cache_dir: str) -> Tuple[bool, str, List[str]]:
@@ -950,7 +982,10 @@ with st.sidebar:
             st.success(f"캐시 파일 {len(files)}개 / 영상 {len(vids)}개 로드")
     with col2:
         if st.button("☁️ GitHub 캐시 동기화", use_container_width=True, disabled=not (CACHE_GITHUB_TOKEN and CACHE_GITHUB_REPO)):
-            ok, msg, saved = sync_cache_from_github(cache_dir)
+            try:
+                ok, msg, saved = sync_cache_from_github(cache_dir)
+            except Exception as e:
+                ok, msg, saved = False, str(e), []
             if ok:
                 st.success(msg)
                 st.session_state["cache_files"] = saved
